@@ -5,7 +5,10 @@ import Foundation
 /// `Sendable` because instances are handed from the main actor to the off-main training task
 /// (see `ModelStore.train(stems:parameters:)`). Every stored property is a value type, so the
 /// conformance is sound rather than a suppression; it also mirrors the repo's `CorpusBook`.
-public struct Word2VecParameters: Sendable {
+///
+/// `Codable` so the app can persist the hyperparameters a cached model was trained with (in a
+/// small sidecar next to the binary model) and show them again after a relaunch.
+public struct Word2VecParameters: Sendable, Codable {
     /// Dimensionality of the word vectors (C: `layer1_size`).
     public var vectorSize: Int = 100
     /// Maximum skip length between words — the context window (C: `window`).

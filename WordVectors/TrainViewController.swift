@@ -314,7 +314,11 @@ final class TrainViewController: UIViewController {
         var lines = ["Vocabulary: \(model.vocabulary.count) words · \(model.vectorSize) dims"]
         if let info = ModelStore.shared.lastTrainingInfo {
             let p = info.parameters
-            lines.append("Trained on \(info.scopeSummary) · \(info.sentenceCount) sentences")
+            // Note provenance so cached detail isn't mistaken for a run that just happened.
+            let scope = ModelStore.shared.trainingInfoFromCache
+                ? "Cached · trained on \(info.scopeSummary) · \(info.sentenceCount) sentences"
+                : "Trained on \(info.scopeSummary) · \(info.sentenceCount) sentences"
+            lines.append(scope)
             lines.append(info.bookTitles.joined(separator: ", "))
             lines.append("\(p.iterations) epochs · window \(p.window) · min count \(p.minCount)")
             lines.append(String(format: "Training time: %.1fs", info.duration))
