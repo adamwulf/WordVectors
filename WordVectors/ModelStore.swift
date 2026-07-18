@@ -16,36 +16,11 @@ import WordVectorKit
 /// is `nonisolated` so the off-main training code can log without crossing an actor boundary.
 nonisolated let appLog = Logger(subsystem: "com.milestonemade.WordVectors", category: "WordVectors")
 
-/// How much of the bundled corpus to train on. The default (`.single`) trains on
-/// one short book so a fresh model is ready in well under a minute on a simulator.
-///
-/// `nonisolated` (the project defaults types to `@MainActor`) so the off-main training
-/// code can read `bookStems`/`title` without crossing an actor boundary.
-nonisolated enum CorpusScope: Int, CaseIterable {
-    case single = 0   // one short book (The Odyssey — has king/queen/man/woman)
-    case few          // three shorter books
-    case all          // every bundled book (minutes — for the patient)
-
-    var title: String {
-        switch self {
-        case .single: return "1 book"
-        case .few:    return "3 books"
-        case .all:    return "All books"
-        }
-    }
-
-    /// Filenames (without extension) to include. `nil` means "every bundled .txt".
-    /// Choosing specific, smaller books keeps the default demo fast. The Odyssey
-    /// (`pg1727`, ~717 KB) is the default because it contains king/queen/man/woman,
-    /// so the classic `king − man + woman` analogy has all inputs in vocabulary.
-    var bookStems: [String]? {
-        switch self {
-        case .single: return ["pg1727"]                    // The Odyssey (~717 KB)
-        case .few:    return ["pg1727", "pg1342", "pg1661"] // + Pride and Prejudice, Sherlock Holmes
-        case .all:    return nil
-        }
-    }
-}
+/// The stem of the book the picker selects by default. The Odyssey (`pg1727`, ~717 KB)
+/// is a good starting point: it's short (a fresh model is ready in well under a minute on
+/// a simulator) and it contains king/queen/man/woman, so the classic `king − man + woman`
+/// analogy has all its inputs in vocabulary.
+nonisolated let defaultBookStem = "pg1727"
 
 /// The high-level state the UI reflects.
 enum ModelState {
@@ -58,10 +33,16 @@ enum ModelState {
 
 /// A snapshot description of the corpus actually used to train the live model.
 struct TrainingInfo {
-    let scope: CorpusScope
+    /// Titles of the books that were trained on, in the order they were loaded.
+    let bookTitles: [String]
     let sentenceCount: Int
     let vocabularyCount: Int
     let duration: TimeInterval
+
+    /// A short human-readable summary of the corpus (e.g. "1 book" or "3 books").
+    var scopeSummary: String {
+        bookTitles.count == 1 ? "1 book" : "\(bookTitles.count) books"
+    }
 }
 
 @MainActor
@@ -170,16 +151,20 @@ final class ModelStore {
 
     /// Kicks off training on a background queue. Progress and completion are delivered on main.
     /// Re-entrancy is guarded: a call while already training is ignored.
-    func train(scope: CorpusScope) {
+    ///
+    /// `stems` is the set of selected book filename stems (e.g. `["pg1727"]`). The caller is
+    /// responsible for ensuring at least one book is selected; an empty list falls back to
+    /// the first bundled book so training never runs on nothing.
+    func train(stems: [String]) {
         if case .training = state { return }
         if case .loading = state { return }
 
         let cacheURL = self.cacheURL
-        appLog.info("Training requested for scope '\(scope.title, privacy: .public)'.")
+        appLog.info("Training requested for \(stems.count, privacy: .public) book(s): \(stems.joined(separator: ", "), privacy: .public).")
         state = .training(progress: 0)
 
         Task.detached(priority: .userInitiated) {
-            let result = ModelStore.performTraining(scope: scope) { progress in
+            let result = ModelStore.performTraining(stems: stems) { progress in
                 // `progress` fires on the background thread — hop to main to update UI.
                 Task { @MainActor in
                     // Only reflect progress while we're still in the training phase.
@@ -219,25 +204,27 @@ final class ModelStore {
     /// Pure, main-actor-free training. Loads the selected corpus files from the app bundle,
     /// preprocesses them, and runs Word2Vec. `progress` is invoked on the calling thread.
     nonisolated private static func performTraining(
-        scope: CorpusScope,
+        stems: [String],
         progress: @escaping (Double) -> Void
     ) -> TrainingResult {
         let start = Date()
 
         // 1) Locate the corpus files in the app bundle.
-        let urls = CorpusLoader.corpusFileURLs(for: scope)
+        let urls = CorpusLoader.corpusFileURLs(forStems: stems)
         guard !urls.isEmpty else {
             return .failure("No corpus files found in the app bundle.")
         }
         appLog.info("Loading \(urls.count, privacy: .public) corpus file(s): \(urls.map { $0.lastPathComponent }.joined(separator: ", "), privacy: .public)")
 
-        // 2) Read + preprocess each book into sentences.
+        // 2) Read + preprocess each book into sentences, capturing its title for the summary.
         var sentences: [String] = []
+        var bookTitles: [String] = []
         for url in urls {
             guard let text = try? String(contentsOf: url, encoding: .utf8) else {
                 appLog.error("Could not read corpus file \(url.lastPathComponent, privacy: .public)")
                 continue
             }
+            bookTitles.append(CorpusLoader.title(for: url) ?? url.deletingPathExtension().lastPathComponent)
             sentences.append(contentsOf: CorpusPreprocessor.sentences(fromGutenberg: text))
         }
         guard !sentences.isEmpty else {
@@ -274,7 +261,7 @@ final class ModelStore {
         appLog.info("Training done in \(String(format: "%.1f", duration), privacy: .public)s. Vocab size = \(model.vocabulary.count, privacy: .public).")
 
         let info = TrainingInfo(
-            scope: scope,
+            bookTitles: bookTitles,
             sentenceCount: sentences.count,
             vocabularyCount: model.vocabulary.count,
             duration: duration
