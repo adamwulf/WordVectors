@@ -32,12 +32,19 @@ enum ModelState {
 }
 
 /// A snapshot description of the corpus actually used to train the live model.
-struct TrainingInfo {
+///
+/// `Codable` so it can be written to a small JSON sidecar beside the cached binary model and
+/// restored on the next launch — that's what lets a cache-loaded model still show its corpus,
+/// timing, and hyperparameters instead of a bare "loaded from cache".
+struct TrainingInfo: Codable {
     /// Titles of the books that were trained on, in the order they were loaded.
     let bookTitles: [String]
     let sentenceCount: Int
     let vocabularyCount: Int
     let duration: TimeInterval
+    /// The hyperparameters this model was actually trained with, so the summary can
+    /// report the values the user chose rather than the hard-coded defaults.
+    let parameters: Word2VecParameters
 
     /// A short human-readable summary of the corpus (e.g. "1 book" or "3 books").
     var scopeSummary: String {
@@ -55,8 +62,13 @@ final class ModelStore {
         didSet { notifyObservers() }
     }
 
-    /// Info about the last successful training run (nil if loaded from cache without retraining).
+    /// Info about the model's training run. Populated from a live run, or restored from the
+    /// cache sidecar on launch; `nil` only when a cached model has no readable sidecar.
     private(set) var lastTrainingInfo: TrainingInfo?
+
+    /// `true` when `lastTrainingInfo` was restored from the on-disk cache rather than produced
+    /// by a training run this session, so the UI can say the detail describes a cached model.
+    private(set) var trainingInfoFromCache = false
 
     /// The ready model, if any.
     var embeddings: WordEmbeddings? {
@@ -99,6 +111,12 @@ final class ModelStore {
         return caches.appendingPathComponent("word-embeddings.wvk", isDirectory: false)
     }
 
+    /// JSON sidecar holding the `TrainingInfo` for the cached model (corpus, timing, params).
+    /// Kept beside `cacheURL`; a missing or stale sidecar just means "no cached detail".
+    private var metadataURL: URL {
+        cacheURL.deletingPathExtension().appendingPathExtension("json")
+    }
+
     // MARK: - Lifecycle
 
     private init() {}
@@ -113,6 +131,7 @@ final class ModelStore {
     /// Attempts to load a previously-cached model. On success, state becomes `.ready`.
     private func loadCachedModel() {
         let url = cacheURL
+        let metadataURL = self.metadataURL
         guard FileManager.default.fileExists(atPath: url.path) else {
             appLog.info("No cached model found; starting idle.")
             state = .idle
@@ -130,7 +149,15 @@ final class ModelStore {
                     return
                 }
                 appLog.info("Loaded cached model: vocab size = \(model.vocabulary.count, privacy: .public).")
-                await MainActor.run { ModelStore.shared.state = .ready(model) }
+                // Best-effort: recover the training detail from the sidecar so a cache-loaded
+                // model can show its corpus, timing, and hyperparameters. Only trust it if it
+                // matches the model actually loaded (a stale sidecar would show wrong detail).
+                let info = ModelStore.loadMetadata(from: metadataURL, matching: model)
+                await MainActor.run {
+                    ModelStore.shared.lastTrainingInfo = info
+                    ModelStore.shared.trainingInfoFromCache = (info != nil)
+                    ModelStore.shared.state = .ready(model)
+                }
             } catch {
                 // Corrupt/incompatible cache — fall back to idle so the user can retrain.
                 appLog.error("Failed to load cached model: \(String(describing: error), privacy: .public)")
@@ -139,10 +166,28 @@ final class ModelStore {
         }
     }
 
-    /// Clears any cached model from disk and resets to idle.
+    /// Decodes the `TrainingInfo` sidecar at `url`, returning it only if it's consistent with
+    /// `model` (same vector size and vocabulary count). A missing, corrupt, or mismatched
+    /// sidecar returns `nil` — the model still loads, just without the extra detail.
+    nonisolated private static func loadMetadata(from url: URL, matching model: WordEmbeddings) -> TrainingInfo? {
+        guard let data = try? Data(contentsOf: url),
+              let info = try? JSONDecoder().decode(TrainingInfo.self, from: data)
+        else { return nil }
+        guard info.parameters.vectorSize == model.vectorSize,
+              info.vocabularyCount == model.vocabulary.count
+        else {
+            appLog.info("Cached model metadata was stale; ignoring it.")
+            return nil
+        }
+        return info
+    }
+
+    /// Clears any cached model (and its metadata sidecar) from disk and resets to idle.
     func clearCache() {
         try? FileManager.default.removeItem(at: cacheURL)
+        try? FileManager.default.removeItem(at: metadataURL)
         lastTrainingInfo = nil
+        trainingInfoFromCache = false
         appLog.info("Cleared cached model.")
         state = .idle
     }
@@ -155,16 +200,21 @@ final class ModelStore {
     /// `stems` is the set of selected book filename stems (e.g. `["pg1727"]`). The caller is
     /// responsible for ensuring at least one book is selected; an empty list falls back to
     /// the first bundled book so training never runs on nothing.
-    func train(stems: [String]) {
+    ///
+    /// `parameters` carries the (already clamped) hyperparameters to train with. The caller —
+    /// the Train tab — supplies the user's edits; the Tier-2/3 fields it doesn't expose keep
+    /// their `Word2VecParameters` defaults.
+    func train(stems: [String], parameters: Word2VecParameters) {
         if case .training = state { return }
         if case .loading = state { return }
 
         let cacheURL = self.cacheURL
+        let metadataURL = self.metadataURL
         appLog.info("Training requested for \(stems.count, privacy: .public) book(s): \(stems.joined(separator: ", "), privacy: .public).")
         state = .training(progress: 0)
 
         Task.detached(priority: .userInitiated) {
-            let result = ModelStore.performTraining(stems: stems) { progress in
+            let result = ModelStore.performTraining(stems: stems, parameters: parameters) { progress in
                 // `progress` fires on the background thread — hop to main to update UI.
                 Task { @MainActor in
                     // Only reflect progress while we're still in the training phase.
@@ -178,13 +228,26 @@ final class ModelStore {
                 switch result {
                 case let .success(model, info):
                     ModelStore.shared.lastTrainingInfo = info
+                    ModelStore.shared.trainingInfoFromCache = false
                     ModelStore.shared.state = .ready(model)
                     // Cache for instant subsequent launches (best-effort; failure is non-fatal).
                     do {
                         try model.save(to: cacheURL)
                         appLog.info("Cached trained model to disk.")
+                        // Only write the metadata sidecar once the model itself is saved, so a
+                        // sidecar never describes a model that isn't on disk. If this fails the
+                        // model still loads next launch, just without the extra detail.
+                        do {
+                            let encoded = try JSONEncoder().encode(info)
+                            try encoded.write(to: metadataURL, options: .atomic)
+                        } catch {
+                            appLog.error("Could not cache model metadata: \(String(describing: error), privacy: .public)")
+                        }
                     } catch {
                         appLog.error("Could not cache model: \(String(describing: error), privacy: .public)")
+                        // The model didn't persist — drop any stale sidecar so a future launch
+                        // doesn't pair fresh metadata with an old cached model.
+                        try? FileManager.default.removeItem(at: metadataURL)
                     }
                 case let .failure(message):
                     appLog.error("Training failed: \(message, privacy: .public)")
@@ -205,6 +268,7 @@ final class ModelStore {
     /// preprocesses them, and runs Word2Vec. `progress` is invoked on the calling thread.
     nonisolated private static func performTraining(
         stems: [String],
+        parameters: Word2VecParameters,
         progress: @escaping (Double) -> Void
     ) -> TrainingResult {
         let start = Date()
@@ -233,13 +297,12 @@ final class ModelStore {
         let wordCount = sentences.reduce(0) { $0 + $1.split(separator: " ").count }
         appLog.info("Loaded \(sentences.count, privacy: .public) sentences (~\(wordCount, privacy: .public) tokens). Training started…")
 
-        // 3) Train. Defaults are tuned for a fast, usable on-device demo.
-        var params = Word2VecParameters()
-        params.vectorSize = 100
-        params.window = 5
-        params.minCount = 5
-        params.iterations = 5
-        params.useCBOW = false   // skip-gram: better quality on a small corpus
+        // 3) Train with the parameters the caller supplied. The Train tab lets the user
+        // edit the Tier-1 knobs (vector size, window, min count, iterations); every other
+        // field keeps its `Word2VecParameters` default (e.g. skip-gram, which gives better
+        // quality on a small corpus).
+        let params = parameters
+        appLog.info("Params: dims=\(params.vectorSize, privacy: .public) window=\(params.window, privacy: .public) minCount=\(params.minCount, privacy: .public) iter=\(params.iterations, privacy: .public) cbow=\(params.useCBOW, privacy: .public)")
 
         let word2vec = Word2Vec(parameters: params)
         var lastLoggedDecile = -1
@@ -264,7 +327,8 @@ final class ModelStore {
             bookTitles: bookTitles,
             sentenceCount: sentences.count,
             vocabularyCount: model.vocabulary.count,
-            duration: duration
+            duration: duration,
+            parameters: params
         )
         return .success(model, info)
     }

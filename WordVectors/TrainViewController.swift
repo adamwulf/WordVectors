@@ -24,6 +24,14 @@ final class TrainViewController: UIViewController {
     /// One checkbox row per book, kept so we can refresh their checked state on toggle.
     private var bookRows: [BookRow] = []
 
+    /// The hyperparameters training will use. Seeded from `Word2VecParameters` defaults; the
+    /// four Tier-1 stepper rows write their edited values back into this struct, and every
+    /// other (Tier-2/3) field is shown read-only and left at its default.
+    private var parameters = Word2VecParameters()
+
+    /// The editable Tier-1 stepper rows, kept so training can be disabled mid-run.
+    private var paramRows: [ParameterStepperRow] = []
+
     private let statusLabel = UILabel()
     private let progressView = UIProgressView(progressViewStyle: .default)
     private let progressLabel = UILabel()
@@ -117,11 +125,56 @@ final class TrainViewController: UIViewController {
             booksStack.addArrangedSubview(empty)
         }
 
+        // Tier-1 editable hyperparameters: one stepper row each, clamped to a sane range.
+        // The steppers write straight back into `parameters`.
+        let paramsCaption = UILabel()
+        paramsCaption.text = "Hyperparameters"
+        paramsCaption.font = .preferredFont(forTextStyle: .headline)
+        paramsCaption.textAlignment = .center
+
+        paramRows = [
+            ParameterStepperRow(
+                title: "Vector length",
+                subtitle: "dimensions per word",
+                range: 25...300, step: 25, value: parameters.vectorSize
+            ) { [weak self] in self?.parameters.vectorSize = $0; self?.parametersChanged() },
+            ParameterStepperRow(
+                title: "Iterations",
+                subtitle: "training epochs",
+                range: 1...20, step: 1, value: parameters.iterations
+            ) { [weak self] in self?.parameters.iterations = $0; self?.parametersChanged() },
+            ParameterStepperRow(
+                title: "Context window",
+                subtitle: "words of context each side",
+                range: 2...10, step: 1, value: parameters.window
+            ) { [weak self] in self?.parameters.window = $0; self?.parametersChanged() },
+            ParameterStepperRow(
+                title: "Min count",
+                subtitle: "drop words rarer than this",
+                range: 1...20, step: 1, value: parameters.minCount
+            ) { [weak self] in self?.parameters.minCount = $0; self?.parametersChanged() },
+        ]
+
+        let paramsStack = UIStackView(arrangedSubviews: paramRows)
+        paramsStack.axis = .vertical
+        paramsStack.spacing = 4
+        paramsStack.alignment = .fill
+
+        // Tier-2/3: shown read-only so the full config is visible, but not editable here.
+        let advancedLabel = UILabel()
+        advancedLabel.font = .preferredFont(forTextStyle: .footnote)
+        advancedLabel.textColor = .secondaryLabel
+        advancedLabel.numberOfLines = 0
+        advancedLabel.text = readOnlyParametersText()
+
         let stack = UIStackView(arrangedSubviews: [
             statusLabel,
             corpusCaption,
             booksStack,
             selectionHintLabel,
+            paramsCaption,
+            paramsStack,
+            advancedLabel,
             trainButton,
             progressView,
             progressLabel,
@@ -199,13 +252,13 @@ final class TrainViewController: UIViewController {
 
     @objc private func trainTapped() {
         guard !orderedSelectedStems.isEmpty else { return }
-        ModelStore.shared.train(stems: orderedSelectedStems)
+        ModelStore.shared.train(stems: orderedSelectedStems, parameters: parameters)
     }
 
     @objc private func retrainTapped() {
         guard !orderedSelectedStems.isEmpty else { return }
         ModelStore.shared.clearCache()
-        ModelStore.shared.train(stems: orderedSelectedStems)
+        ModelStore.shared.train(stems: orderedSelectedStems, parameters: parameters)
     }
 
     // MARK: - State rendering
@@ -219,7 +272,7 @@ final class TrainViewController: UIViewController {
             setControlsEnabled(idle: true)
             trainButton.isHidden = false
             retrainButton.isHidden = true
-            detailLabel.text = "Pick one or more books and tap Train. Skip-gram, 100 dims, 5 epochs."
+            detailLabel.text = idleDetailText
 
         case .loading:
             statusLabel.text = "Loading cached model…"
@@ -260,8 +313,14 @@ final class TrainViewController: UIViewController {
     private func readyDetail(model: WordEmbeddings) -> String {
         var lines = ["Vocabulary: \(model.vocabulary.count) words · \(model.vectorSize) dims"]
         if let info = ModelStore.shared.lastTrainingInfo {
-            lines.append("Trained on \(info.scopeSummary) · \(info.sentenceCount) sentences")
+            let p = info.parameters
+            // Note provenance so cached detail isn't mistaken for a run that just happened.
+            let scope = ModelStore.shared.trainingInfoFromCache
+                ? "Cached · trained on \(info.scopeSummary) · \(info.sentenceCount) sentences"
+                : "Trained on \(info.scopeSummary) · \(info.sentenceCount) sentences"
+            lines.append(scope)
             lines.append(info.bookTitles.joined(separator: ", "))
+            lines.append("\(p.iterations) epochs · window \(p.window) · min count \(p.minCount)")
             lines.append(String(format: "Training time: %.1fs", info.duration))
         } else {
             lines.append("Loaded from cache. Use the Nearest and Word Algebra tabs.")
@@ -269,10 +328,38 @@ final class TrainViewController: UIViewController {
         return lines.joined(separator: "\n")
     }
 
+    /// The idle-state hint, reflecting the currently-selected editable hyperparameters so it
+    /// never goes stale as the user adjusts the steppers.
+    private var idleDetailText: String {
+        let model = parameters.useCBOW ? "CBOW" : "Skip-gram"
+        return "Pick one or more books, tune the hyperparameters, and tap Train. "
+            + "\(model), \(parameters.vectorSize) dims, \(parameters.iterations) epochs."
+    }
+
+    /// Called after a stepper edits `parameters`. Editing a hyperparameter doesn't change the
+    /// model state, so `render` won't fire — refresh the idle hint here so it stays accurate.
+    private func parametersChanged() {
+        if case .idle = ModelStore.shared.state {
+            detailLabel.text = idleDetailText
+        }
+    }
+
+    /// Describes the Tier-2/3 parameters the user can see but not edit here. Reads from a
+    /// fresh `Word2VecParameters` so it always matches the defaults training actually uses.
+    private func readOnlyParametersText() -> String {
+        let p = Word2VecParameters()
+        let model = p.useCBOW ? "CBOW" : "skip-gram"
+        return [
+            "Fixed: \(model) · \(p.negativeSamples) negative samples",
+            String(format: "learning rate %.3f · subsample %.0e", p.initialAlpha, p.subsample),
+        ].joined(separator: "\n")
+    }
+
     /// When `idle` is false the user is mid-run: disable inputs to prevent overlap.
     /// When idle, Train also requires at least one selected book.
     private func setControlsEnabled(idle: Bool) {
         for row in bookRows { row.isEnabled = idle }
+        for row in paramRows { row.isEnabled = idle }
         trainButton.isEnabled = idle && !selectedStems.isEmpty
         retrainButton.isEnabled = idle && !selectedStems.isEmpty
     }
@@ -346,6 +433,117 @@ private final class BookRow: UIControl {
 
     @objc private func tapped() {
         onToggle?()
+    }
+}
+
+// MARK: - Hyperparameter stepper row
+
+/// A labeled row with a `UIStepper` for one integer hyperparameter. The stepper is clamped to
+/// `range` and moves by `step`; the current value shows to the left of the +/− control, and
+/// each change is reported through `onChange` as the clamped integer value.
+private final class ParameterStepperRow: UIView {
+
+    var onChange: ((Int) -> Void)?
+
+    private let titleLabel = UILabel()
+    private let subtitleLabel = UILabel()
+    private let valueLabel = UILabel()
+    private let stepper = UIStepper()
+
+    init(title: String,
+         subtitle: String,
+         range: ClosedRange<Int>,
+         step: Int,
+         value: Int,
+         onChange: @escaping (Int) -> Void) {
+        self.onChange = onChange
+        super.init(frame: .zero)
+
+        titleLabel.text = title
+        titleLabel.font = .preferredFont(forTextStyle: .body)
+        titleLabel.numberOfLines = 0
+
+        subtitleLabel.text = subtitle
+        subtitleLabel.font = .preferredFont(forTextStyle: .caption1)
+        subtitleLabel.textColor = .secondaryLabel
+        subtitleLabel.numberOfLines = 0
+
+        valueLabel.font = .preferredFont(forTextStyle: .body).monospaced()
+        valueLabel.textColor = .label
+        valueLabel.textAlignment = .right
+        valueLabel.setContentHuggingPriority(.required, for: .horizontal)
+        valueLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        stepper.minimumValue = Double(range.lowerBound)
+        stepper.maximumValue = Double(range.upperBound)
+        stepper.stepValue = Double(step)
+        stepper.value = Double(value)
+        stepper.setContentHuggingPriority(.required, for: .horizontal)
+        stepper.setContentCompressionResistancePriority(.required, for: .horizontal)
+        stepper.addTarget(self, action: #selector(stepperChanged), for: .valueChanged)
+
+        let labels = UIStackView(arrangedSubviews: [titleLabel, subtitleLabel])
+        labels.axis = .vertical
+        labels.spacing = 2
+        labels.alignment = .leading
+
+        let row = UIStackView(arrangedSubviews: [labels, valueLabel, stepper])
+        row.axis = .horizontal
+        row.spacing = 12
+        row.alignment = .center
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+
+        NSLayoutConstraint.activate([
+            row.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            row.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
+
+        // Let VoiceOver reach the stepper itself (an adjustable control) rather than
+        // collapsing the row into one static element — otherwise the value can't be changed
+        // with the rotor. The stepper carries the parameter's name as its label.
+        stepper.accessibilityLabel = title
+        updateValueDisplay()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// Current stepper value as a clamped integer (the stepper already enforces range/step).
+    private var currentValue: Int { Int(stepper.value.rounded()) }
+
+    @objc private func stepperChanged() {
+        updateValueDisplay()
+        onChange?(currentValue)
+    }
+
+    private func updateValueDisplay() {
+        valueLabel.text = "\(currentValue)"
+        stepper.accessibilityValue = "\(currentValue)"
+    }
+
+    var isEnabled: Bool = true {
+        didSet {
+            stepper.isEnabled = isEnabled
+            alpha = isEnabled ? 1.0 : 0.5
+        }
+    }
+}
+
+// MARK: - Font helper
+
+private extension UIFont {
+    /// A monospaced-digit variant so value labels don't jitter as digits change width.
+    func monospaced() -> UIFont {
+        let descriptor = fontDescriptor.addingAttributes([
+            .featureSettings: [[
+                UIFontDescriptor.FeatureKey.type: kNumberSpacingType,
+                UIFontDescriptor.FeatureKey.selector: kMonospacedNumbersSelector,
+            ]],
+        ])
+        return UIFont(descriptor: descriptor, size: pointSize)
     }
 }
 
