@@ -38,6 +38,9 @@ struct TrainingInfo {
     let sentenceCount: Int
     let vocabularyCount: Int
     let duration: TimeInterval
+    /// The hyperparameters this model was actually trained with, so the summary can
+    /// report the values the user chose rather than the hard-coded defaults.
+    let parameters: Word2VecParameters
 
     /// A short human-readable summary of the corpus (e.g. "1 book" or "3 books").
     var scopeSummary: String {
@@ -155,7 +158,11 @@ final class ModelStore {
     /// `stems` is the set of selected book filename stems (e.g. `["pg1727"]`). The caller is
     /// responsible for ensuring at least one book is selected; an empty list falls back to
     /// the first bundled book so training never runs on nothing.
-    func train(stems: [String]) {
+    ///
+    /// `parameters` carries the (already clamped) hyperparameters to train with. The caller —
+    /// the Train tab — supplies the user's edits; the Tier-2/3 fields it doesn't expose keep
+    /// their `Word2VecParameters` defaults.
+    func train(stems: [String], parameters: Word2VecParameters) {
         if case .training = state { return }
         if case .loading = state { return }
 
@@ -164,7 +171,7 @@ final class ModelStore {
         state = .training(progress: 0)
 
         Task.detached(priority: .userInitiated) {
-            let result = ModelStore.performTraining(stems: stems) { progress in
+            let result = ModelStore.performTraining(stems: stems, parameters: parameters) { progress in
                 // `progress` fires on the background thread — hop to main to update UI.
                 Task { @MainActor in
                     // Only reflect progress while we're still in the training phase.
@@ -205,6 +212,7 @@ final class ModelStore {
     /// preprocesses them, and runs Word2Vec. `progress` is invoked on the calling thread.
     nonisolated private static func performTraining(
         stems: [String],
+        parameters: Word2VecParameters,
         progress: @escaping (Double) -> Void
     ) -> TrainingResult {
         let start = Date()
@@ -233,13 +241,12 @@ final class ModelStore {
         let wordCount = sentences.reduce(0) { $0 + $1.split(separator: " ").count }
         appLog.info("Loaded \(sentences.count, privacy: .public) sentences (~\(wordCount, privacy: .public) tokens). Training started…")
 
-        // 3) Train. Defaults are tuned for a fast, usable on-device demo.
-        var params = Word2VecParameters()
-        params.vectorSize = 100
-        params.window = 5
-        params.minCount = 5
-        params.iterations = 5
-        params.useCBOW = false   // skip-gram: better quality on a small corpus
+        // 3) Train with the parameters the caller supplied. The Train tab lets the user
+        // edit the Tier-1 knobs (vector size, window, min count, iterations); every other
+        // field keeps its `Word2VecParameters` default (e.g. skip-gram, which gives better
+        // quality on a small corpus).
+        let params = parameters
+        appLog.info("Params: dims=\(params.vectorSize, privacy: .public) window=\(params.window, privacy: .public) minCount=\(params.minCount, privacy: .public) iter=\(params.iterations, privacy: .public) cbow=\(params.useCBOW, privacy: .public)")
 
         let word2vec = Word2Vec(parameters: params)
         var lastLoggedDecile = -1
@@ -264,7 +271,8 @@ final class ModelStore {
             bookTitles: bookTitles,
             sentenceCount: sentences.count,
             vocabularyCount: model.vocabulary.count,
-            duration: duration
+            duration: duration,
+            parameters: params
         )
         return .success(model, info)
     }
