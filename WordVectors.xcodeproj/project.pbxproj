@@ -23,6 +23,10 @@
 		};
 /* End PBXContainerItemProxy section */
 
+/* Begin PBXBuildFile section */
+		AA01BB01CC01DD01EE010003 /* WordVectorKit in Frameworks */ = {isa = PBXBuildFile; productRef = AA01BB01CC01DD01EE010002 /* WordVectorKit */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		C5497EB3300BF36900FFB09B /* WordVectors.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WordVectors.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C5497EC9300BF36A00FFB09B /* WordVectorsTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = WordVectorsTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -65,6 +69,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA01BB01CC01DD01EE010003 /* WordVectorKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -125,6 +130,7 @@
 			);
 			name = WordVectors;
 			packageProductDependencies = (
+				AA01BB01CC01DD01EE010002 /* WordVectorKit */,
 			);
 			productName = WordVectors;
 			productReference = C5497EB3300BF36900FFB09B /* WordVectors.app */;
@@ -208,6 +214,9 @@
 			);
 			mainGroup = C5497EAA300BF36900FFB09B;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				AA01BB01CC01DD01EE010001 /* XCLocalSwiftPackageReference "WordVectorKit" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = C5497EB4300BF36900FFB09B /* Products */;
 			projectDirPath = "";
@@ -294,7 +303,6 @@
 				INFOPLIST_FILE = WordVectors/Info.plist;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
-				INFOPLIST_KEY_UIMainStoryboardFile = Main;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -326,7 +334,6 @@
 				INFOPLIST_FILE = WordVectors/Info.plist;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
-				INFOPLIST_KEY_UIMainStoryboardFile = Main;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -591,6 +598,20 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		AA01BB01CC01DD01EE010001 /* XCLocalSwiftPackageReference "WordVectorKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = WordVectorKit;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		AA01BB01CC01DD01EE010002 /* WordVectorKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = WordVectorKit;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = C5497EAB300BF36900FFB09B /* Project object */;
 }
