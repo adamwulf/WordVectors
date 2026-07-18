@@ -31,11 +31,20 @@ public final class Word2Vec {
     // MARK: - Ported constants (ref: word2vec.c lines 22-23, 49)
 
     private static let expTableSize = 1000   // ref: word2vec.c line 22 (EXP_TABLE_SIZE)
-    private static let maxExp: Float = 6      // ref: word2vec.c line 23 (MAX_EXP)
+    private static let maxExpInt = 6          // ref: word2vec.c line 23 (MAX_EXP, an int #define)
+    private static let maxExp: Float = Float(maxExpInt) // Float form for the +/- clamp comparisons.
     private static let unigramPower = 0.75    // ref: word2vec.c line 55 (power)
+
+    /// Sigmoid-table lookup scale. In the C this is `EXP_TABLE_SIZE / MAX_EXP / 2` where both
+    /// are int #defines, so it is INTEGER division: 1000 / 6 / 2 = 83 (NOT 83.333). Computing
+    /// it as float division diverges on ~87.5% of lookups and, at f == MAX_EXP exactly, would
+    /// index expTable[1000] (the uninitialized slot). We reproduce the integer math here.
+    /// ref: word2vec.c lines 456, 481, 512, 537
+    private static let expScale = Float(expTableSize / maxExpInt / 2) // == 83
+
     // The negative-sampling table size (C: `table_size = 1e8`, ref: word2vec.c line 49)
-    // is taken from parameters so it defaults to the exact reference value but can be
-    // reduced in tests for speed without changing the sampling distribution.
+    // is taken from parameters. We default it lower than the C (see Word2VecParameters) to
+    // avoid a large single allocation on device; it can also be reduced further in tests.
 
     // MARK: - Configuration
 
@@ -63,6 +72,14 @@ public final class Word2Vec {
         }
         self.expTable = table
     }
+
+    // MARK: - Test-only accessors (internal; used by @testable tests to verify the port)
+
+    /// The integer-math sigmoid-table scale (must equal 83 to match the C). ref: fix #4
+    internal static var expScaleForTesting: Int { expTableSize / maxExpInt / 2 }
+
+    /// Reads a value from the precomputed sigmoid/exp table (for bounds/zero-slot tests).
+    internal func expTableValueForTesting(_ idx: Int) -> Float { expTable[idx] }
 
     // MARK: - Vocabulary
 
@@ -144,7 +161,9 @@ public final class Word2Vec {
         var neu1 = [Float](repeating: 0, count: vectorSize)
         var neu1e = [Float](repeating: 0, count: vectorSize)
 
-        let window = params.window
+        // Clamp window to >= 1: `nextRandom % UInt64(window)` would trap on window == 0.
+        // A window of 0 has no context anyway, so 1 is the smallest meaningful value.
+        let window = max(1, params.window)
         let negative = params.negativeSamples
         let sample = params.subsample
         let useCBOW = params.useCBOW
@@ -276,6 +295,9 @@ public final class Word2Vec {
                 target = word
                 label = 1
             } else {
+                // With a 1-word vocab there are no valid negatives; `% UInt64(vocabSize - 1)`
+                // would trap on `% 0`. Skip the negative draw entirely in that case.
+                guard vocabSize > 1 else { continue }
                 nextRandom = nextRandom &* 25214903917 &+ 11
                 var t = Int(unigramTable[Int((nextRandom >> 16) % UInt64(unigramTable.count))])
                 if t == 0 { t = Int(nextRandom % UInt64(vocabSize - 1)) + 1 }
@@ -297,7 +319,7 @@ public final class Word2Vec {
             } else if f < -Word2Vec.maxExp {
                 g = (label - 0) * alpha
             } else {
-                let idx = Int((f + Word2Vec.maxExp) * (Float(Word2Vec.expTableSize) / Word2Vec.maxExp / 2))
+                let idx = Int((f + Word2Vec.maxExp) * Word2Vec.expScale)
                 g = (label - expTable[idx]) * alpha
             }
 
@@ -353,6 +375,9 @@ public final class Word2Vec {
                             target = word
                             label = 1
                         } else {
+                            // With a 1-word vocab there are no valid negatives; `% UInt64(vocabSize - 1)`
+                            // would trap on `% 0`. Skip the negative draw entirely in that case.
+                            guard vocabSize > 1 else { continue }
                             nextRandom = nextRandom &* 25214903917 &+ 11
                             var t = Int(unigramTable[Int((nextRandom >> 16) % UInt64(unigramTable.count))])
                             if t == 0 { t = Int(nextRandom % UInt64(vocabSize - 1)) + 1 }
@@ -373,7 +398,7 @@ public final class Word2Vec {
                         } else if f < -Word2Vec.maxExp {
                             g = (label - 0) * alpha
                         } else {
-                            let idx = Int((f + Word2Vec.maxExp) * (Float(Word2Vec.expTableSize) / Word2Vec.maxExp / 2))
+                            let idx = Int((f + Word2Vec.maxExp) * Word2Vec.expScale)
                             g = (label - expTable[idx]) * alpha
                         }
 
@@ -431,10 +456,13 @@ public final class Word2Vec {
     // MARK: - Unigram negative-sampling table (ref: word2vec.c lines 52-68)
 
     /// Builds the negative-sampling table using the `cn^0.75` distribution.
-    /// Stored as `Int32` to match the C's `int *table` and keep memory reasonable at 1e8 entries.
+    /// Stored as `Int32` to match the C's `int *table`; the entry count comes from
+    /// `params.unigramTableSize` (default 1e7 = ~40 MB, vs. the C's 1e8 = ~400 MB).
     private func buildUnigramTable(vocab: [VocabWord]) -> [Int32] {
         let vocabSize = vocab.count
-        let tableSize = params.unigramTableSize
+        // Clamp to >= 1: a zero-length table would make `% UInt64(unigramTable.count)` trap
+        // at every negative-sampling draw.
+        let tableSize = max(1, params.unigramTableSize)
         var table = [Int32](repeating: 0, count: tableSize)
 
         let power = Word2Vec.unigramPower

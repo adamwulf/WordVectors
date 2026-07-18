@@ -21,14 +21,16 @@ public struct Word2VecParameters {
     /// Seed for the linear-congruential RNG so results are reproducible.
     public var seed: UInt64 = 1
 
-    /// Resolution of the unigram negative-sampling table (C: `table_size`, fixed at 1e8).
+    /// Resolution of the unigram negative-sampling table (C: `table_size`).
     ///
-    /// This is the number of slots the `cn^0.75` distribution is quantized into. The C
-    /// reference hard-codes `1e8`, and that is the default here for faithful numerical
-    /// behavior. It is exposed (internal) only so tests can use a smaller resolution for
-    /// speed — a smaller table still encodes the same distribution, just at coarser
-    /// quantization, so it does not change the algorithm, only the sampling granularity.
-    internal var unigramTableSize: Int = Int(1e8)
+    /// This is the number of slots the `cn^0.75` distribution is quantized into. A larger
+    /// table gives finer sampling granularity but costs `4 * unigramTableSize` bytes (the
+    /// table is `Int32`). The C reference hard-codes `1e8` (~400 MB), which was fine for a
+    /// desktop but risks an OOM/jetsam kill on an iOS device, so we default LOWER — `1e7`
+    /// (10M entries, ~40 MB) — which is still ample resolution for on-device corpora.
+    /// Raise it toward `1e8` to match the reference exactly, or lower it further for tests.
+    /// Values are clamped to `>= 1` at build time to avoid a divide-by-zero in sampling.
+    public var unigramTableSize: Int = Int(1e7)
 
     public init() {}
 }

@@ -3,9 +3,10 @@ import XCTest
 
 final class Word2VecTrainingTests: XCTestCase {
 
-    /// A small negative-sampling table resolution for fast tests. The reference default is
-    /// 1e8; a smaller value encodes the same cn^0.75 distribution at coarser quantization,
-    /// so it keeps the smoke tests fast (<a few seconds) without changing the algorithm.
+    /// A small negative-sampling table resolution for fast tests. The package default is
+    /// 1e7 (the C reference uses 1e8); a smaller value encodes the same cn^0.75 distribution
+    /// at coarser quantization, so it keeps the smoke tests fast (<a few seconds) without
+    /// changing the algorithm.
     private static let fastTableSize = 100_000
 
     /// Builds a tiny synthetic corpus with strong co-occurrence structure. The words
