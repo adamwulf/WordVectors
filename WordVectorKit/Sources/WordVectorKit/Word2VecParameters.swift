@@ -1,7 +1,11 @@
 import Foundation
 
 /// Training hyperparameters for `Word2Vec`. Names mirror the C reference's globals.
-public struct Word2VecParameters {
+///
+/// `Sendable` because instances are handed from the main actor to the off-main training task
+/// (see `ModelStore.train(stems:parameters:)`). Every stored property is a value type, so the
+/// conformance is sound rather than a suppression; it also mirrors the repo's `CorpusBook`.
+public struct Word2VecParameters: Sendable {
     /// Dimensionality of the word vectors (C: `layer1_size`).
     public var vectorSize: Int = 100
     /// Maximum skip length between words — the context window (C: `window`).

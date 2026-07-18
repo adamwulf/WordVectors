@@ -497,8 +497,10 @@ private final class ParameterStepperRow: UIView {
             row.trailingAnchor.constraint(equalTo: trailingAnchor),
         ])
 
-        isAccessibilityElement = true
-        accessibilityLabel = title
+        // Let VoiceOver reach the stepper itself (an adjustable control) rather than
+        // collapsing the row into one static element — otherwise the value can't be changed
+        // with the rotor. The stepper carries the parameter's name as its label.
+        stepper.accessibilityLabel = title
         updateValueDisplay()
     }
 
@@ -515,7 +517,7 @@ private final class ParameterStepperRow: UIView {
 
     private func updateValueDisplay() {
         valueLabel.text = "\(currentValue)"
-        accessibilityValue = "\(currentValue)"
+        stepper.accessibilityValue = "\(currentValue)"
     }
 
     var isEnabled: Bool = true {
