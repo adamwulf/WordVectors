@@ -188,7 +188,8 @@ final class AnalogyViewController: UIViewController, UITextFieldDelegate, UITabl
             results = []
             setMessage("No model yet — train one on the Train tab.")
             tableView.reloadData()
-        } else if messageLabel.text == nil || messageLabel.text?.contains("No model yet") == true {
+        } else if results.isEmpty {
+            // Prompt the user only if they haven't already computed an analogy this session.
             setMessage("Model ready. Tap Compute to try king − man + woman.")
         }
     }

@@ -135,7 +135,8 @@ final class NearestViewController: UIViewController, UITextFieldDelegate, UITabl
         case .ready:
             wordField.isEnabled = true
             searchButton.isEnabled = true
-            if messageLabel.text == nil || messageLabel.text?.contains("Train a model first") == true {
+            // Prompt the user only if they haven't already run a search this session.
+            if results.isEmpty {
                 setMessage("Model ready. Enter a word and tap Find Nearest.")
             }
         default:
