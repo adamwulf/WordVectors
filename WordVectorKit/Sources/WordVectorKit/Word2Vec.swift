@@ -25,23 +25,24 @@
 import Foundation
 import Accelerate
 
-/// Shared progress state from `TrainModelThread`. Only this scalar is synchronized; the model
-/// weights intentionally remain lock-free. ref: word2vec.c lines 387-399
+/// Shared progress counter. Tracks the running total of processed words so the `progress` closure
+/// can report a monotonic 0…1 fraction across workers. Only this scalar is synchronized; in the
+/// Hogwild path the model weights intentionally remain lock-free. Alpha decay is computed
+/// separately as a deterministic function of words processed (see `deterministicAlpha`), so it no
+/// longer depends on the order in which workers reach this counter. ref: word2vec.c lines 387-399
 private final class TrainingProgressCounter {
     private let lock = NSLock()
     private var wordCountActual = 0
 
-    func add(_ count: Int, startingAlpha: Double, denominator: Int,
-             totalTrainWords: Int, progress: ((Double) -> Void)?) -> Double {
+    /// Adds `count` processed words and reports the new progress fraction. `denominator` is accepted
+    /// for symmetry with the C's alpha math but only clamps the reported fraction to `totalTrainWords`.
+    func add(_ count: Int, denominator: Int, totalTrainWords: Int, progress: ((Double) -> Void)?) {
         lock.lock()
         wordCountActual += count
-        var alpha = startingAlpha * (1 - Double(wordCountActual) / Double(denominator))
-        if alpha < startingAlpha * 0.0001 { alpha = startingAlpha * 0.0001 }
         let fraction = min(1.0, Double(wordCountActual) / Double(totalTrainWords))
         lock.unlock()
 
         progress?(fraction)
-        return alpha
     }
 }
 
@@ -166,138 +167,30 @@ public final class Word2Vec {
         let unigramTable = buildUnigramTable(vocab: vocab)
 
         // 4) Training loop — port of TrainModelThread. ref: word2vec.c lines 374-555
-        let startingAlpha = params.initialAlpha
-        let iterCount = params.iterations
-        // Total words the C would process across all epochs (iter * train_words).
-        let totalTrainWords = max(1, iterCount * trainWords)
         let numThreads = max(1, ProcessInfo.processInfo.activeProcessorCount)
-        let progressCounter = TrainingProgressCounter()
+        let config = TrainingConfig(
+            startingAlpha: params.initialAlpha,
+            iterCount: params.iterations,
+            // Clamp window to >= 1: `nextRandom % UInt64(window)` would trap on window == 0.
+            // A window of 0 has no context anyway, so 1 is the smallest meaningful value.
+            window: max(1, params.window),
+            negative: params.negativeSamples,
+            sample: params.subsample,
+            useCBOW: params.useCBOW,
+            vocabSize: vocabSize,
+            trainWords: trainWords,
+            numThreads: numThreads
+        )
 
-        // Clamp window to >= 1: `nextRandom % UInt64(window)` would trap on window == 0.
-        // A window of 0 has no context anyway, so 1 is the smallest meaningful value.
-        let window = max(1, params.window)
-        let negative = params.negativeSamples
-        let sample = params.subsample
-        let useCBOW = params.useCBOW
-        let trainWordsDouble = Double(trainWords)
-        let sampleTrainWords = sample * trainWordsDouble
-
-        syn0.withUnsafeMutableBufferPointer { syn0Buf in
-        syn1neg.withUnsafeMutableBufferPointer { syn1Buf in
-        expTable.withUnsafeBufferPointer { expBuf in
-
-            let syn0p = syn0Buf.baseAddress!
-            let syn1p = syn1Buf.baseAddress!
-            let expp = expBuf.baseAddress!
-
-            DispatchQueue.concurrentPerform(iterations: numThreads) { threadId in
-                // Each worker owns the same local state as TrainModelThread.
-                // ref: word2vec.c lines 376-383
-                var nextRandom = UInt64(threadId) // ref: word2vec.c line 378
-                var wordCount = 0
-                var lastWordCount = 0
-                var alpha = startingAlpha
-                var neu1 = [Float](repeating: 0, count: vectorSize)
-                var neu1e = [Float](repeating: 0, count: vectorSize)
-                var sen: [Int] = []
-
-                // Contiguous sentence chunks are the in-memory equivalent of the C port's
-                // per-thread file offsets. ref: word2vec.c lines 385-386
-                let chunkStart = tokenizedSentences.count * threadId / numThreads
-                let chunkEnd = tokenizedSentences.count * (threadId + 1) / numThreads
-
-                neu1.withUnsafeMutableBufferPointer { neu1Buf in
-                neu1e.withUnsafeMutableBufferPointer { neu1eBuf in
-                    let neu1p = neu1Buf.baseAddress!
-                    let neu1ep = neu1eBuf.baseAddress!
-
-                    // `local_iter` belongs to each thread in the C. ref: word2vec.c line 377
-                    for _ in 0..<iterCount {
-                        for sentenceIndex in chunkStart..<chunkEnd {
-                            let sentence = tokenizedSentences[sentenceIndex]
-
-                            // 3a) Apply subsampling to build this sentence's kept-token list.
-                            //     ref: word2vec.c lines 407-412
-                            sen.removeAll(keepingCapacity: true)
-                            sen.reserveCapacity(sentence.count)
-                            for word in sentence {
-                                wordCount += 1
-                                if sample > 0 {
-                                    let cn = Double(vocab[word].cn)
-                                    // ran = (sqrt(cn / (sample*train_words)) + 1) * (sample*train_words) / cn
-                                    let ran = (sqrt(cn / sampleTrainWords) + 1) * sampleTrainWords / cn
-                                    nextRandom = nextRandom &* 25214903917 &+ 11
-                                    if ran < Double(nextRandom & 0xFFFF) / Double(65536) {
-                                        continue // discard this frequent word
-                                    }
-                                }
-                                sen.append(word)
-                            }
-
-                            let sentenceLength = sen.count
-
-                            // Periodic alpha decay + progress. ref: word2vec.c lines 387-399
-                            if wordCount - lastWordCount > 10000 {
-                                alpha = progressCounter.add(
-                                    wordCount - lastWordCount,
-                                    startingAlpha: startingAlpha,
-                                    denominator: iterCount * trainWords + 1,
-                                    totalTrainWords: totalTrainWords,
-                                    progress: progress
-                                )
-                                lastWordCount = wordCount
-                            }
-
-                            // 3b) For each position in the sentence, run the CBOW or skip-gram update.
-                            for sentencePosition in 0..<sentenceLength {
-                                let word = sen[sentencePosition]
-
-                                // Zero the hidden accumulators. ref: word2vec.c lines 431-432
-                                for c in 0..<vectorSize { neu1p[c] = 0 }
-                                for c in 0..<vectorSize { neu1ep[c] = 0 }
-
-                                // Random window shrink b in [0, window). ref: word2vec.c lines 433-434
-                                nextRandom = nextRandom &* 25214903917 &+ 11
-                                let b = Int(nextRandom % UInt64(window))
-
-                                if useCBOW {
-                                    trainCBOW(word: word, b: b, window: window, negative: negative,
-                                              sentencePosition: sentencePosition, sentenceLength: sentenceLength,
-                                              sen: sen, vocabSize: vocabSize, alpha: Float(alpha),
-                                              unigramTable: unigramTable, nextRandom: &nextRandom,
-                                              syn0: syn0p, syn1neg: syn1p, expTable: expp,
-                                              neu1: neu1p, neu1e: neu1ep)
-                                } else {
-                                    trainSkipGram(word: word, b: b, window: window, negative: negative,
-                                                  sentencePosition: sentencePosition, sentenceLength: sentenceLength,
-                                                  sen: sen, vocabSize: vocabSize, alpha: Float(alpha),
-                                                  unigramTable: unigramTable, nextRandom: &nextRandom,
-                                                  syn0: syn0p, syn1neg: syn1p, expTable: expp,
-                                                  neu1e: neu1ep)
-                                }
-                            }
-                        }
-
-                        // Flush this worker's remaining count before its next local epoch.
-                        // ref: word2vec.c lines 421-428
-                        let remainder = wordCount - lastWordCount
-                        if remainder > 0 {
-                            alpha = progressCounter.add(
-                                remainder,
-                                startingAlpha: startingAlpha,
-                                denominator: iterCount * trainWords + 1,
-                                totalTrainWords: totalTrainWords,
-                                progress: progress
-                            )
-                        }
-                        wordCount = 0
-                        lastWordCount = 0
-                    }
-
-                }}
-            }
-
-        }}}
+        if params.deterministic {
+            trainDeterministic(config: config, vocab: vocab, tokenizedSentences: tokenizedSentences,
+                               unigramTable: unigramTable, syn0: &syn0, syn1neg: &syn1neg,
+                               progress: progress)
+        } else {
+            trainHogwild(config: config, vocab: vocab, tokenizedSentences: tokenizedSentences,
+                         unigramTable: unigramTable, syn0: &syn0, syn1neg: &syn1neg,
+                         progress: progress)
+        }
 
         progress?(1.0)
 
@@ -305,6 +198,283 @@ public final class Word2Vec {
         // ref: word2vec.c lines 574-580 — it writes syn0 rows as the word vectors.
         let words = vocab.map { $0.word }
         return WordEmbeddings(words: words, vectorSize: vectorSize, storage: syn0)
+    }
+
+    /// Immutable per-run training constants, shared by both the Hogwild and deterministic paths.
+    private struct TrainingConfig {
+        let startingAlpha: Double
+        let iterCount: Int
+        let window: Int
+        let negative: Int
+        let sample: Double
+        let useCBOW: Bool
+        let vocabSize: Int
+        let trainWords: Int
+        let numThreads: Int
+
+        /// Total words the C would process across all epochs (iter * train_words).
+        var totalTrainWords: Int { max(1, iterCount * trainWords) }
+        /// Denominator for alpha decay. ref: word2vec.c line 393
+        var alphaDenominator: Int { iterCount * trainWords + 1 }
+        var sampleTrainWords: Double { sample * Double(trainWords) }
+    }
+
+    /// Runs one worker's pass over its sentence chunk for a single epoch, updating `syn0`/`syn1neg`
+    /// through the supplied pointers. Both training paths share this so the *only* difference between
+    /// them is whether those pointers address the shared matrices (Hogwild) or a per-worker private
+    /// copy (deterministic). `alpha` is computed deterministically from `baseWordCount + localWordCount`
+    /// so it never depends on thread interleaving. Returns the number of (pre-subsample) train words
+    /// this worker consumed, for progress reporting.
+    private func runEpochChunk(threadId: Int, epoch: Int, config: TrainingConfig,
+                               vocab: [VocabWord], tokenizedSentences: [[Int]],
+                               unigramTable: [Int32], nextRandom: inout UInt64,
+                               syn0: UnsafeMutablePointer<Float>, syn1neg: UnsafeMutablePointer<Float>,
+                               neu1: UnsafeMutablePointer<Float>, neu1e: UnsafeMutablePointer<Float>,
+                               sen: inout [Int], reportChunkWords: (Int) -> Void) -> Int {
+        let numThreads = config.numThreads
+        // Contiguous sentence chunks are the in-memory equivalent of the C port's per-thread
+        // file offsets. ref: word2vec.c lines 385-386
+        let chunkStart = tokenizedSentences.count * threadId / numThreads
+        let chunkEnd = tokenizedSentences.count * (threadId + 1) / numThreads
+
+        // Words fully processed before this epoch begins. Used to make alpha a pure function of
+        // (epoch, local progress) rather than of the shared, order-dependent progress counter.
+        let baseWordCount = epoch * config.trainWords
+        var localWordCount = 0
+        var lastReported = 0
+
+        expTable.withUnsafeBufferPointer { expBuf in
+            let expp = expBuf.baseAddress!
+
+            for sentenceIndex in chunkStart..<chunkEnd {
+                let sentence = tokenizedSentences[sentenceIndex]
+
+                // 3a) Apply subsampling to build this sentence's kept-token list.
+                //     ref: word2vec.c lines 407-412
+                sen.removeAll(keepingCapacity: true)
+                sen.reserveCapacity(sentence.count)
+                for word in sentence {
+                    localWordCount += 1
+                    if config.sample > 0 {
+                        let cn = Double(vocab[word].cn)
+                        // ran = (sqrt(cn / (sample*train_words)) + 1) * (sample*train_words) / cn
+                        let ran = (sqrt(cn / config.sampleTrainWords) + 1) * config.sampleTrainWords / cn
+                        nextRandom = nextRandom &* 25214903917 &+ 11
+                        if ran < Double(nextRandom & 0xFFFF) / Double(65536) {
+                            continue // discard this frequent word
+                        }
+                    }
+                    sen.append(word)
+                }
+
+                let sentenceLength = sen.count
+
+                // Deterministic alpha decay + periodic progress. ref: word2vec.c lines 387-399.
+                // alpha depends only on (baseWordCount + localWordCount), never on scheduling.
+                let alpha = deterministicAlpha(processed: baseWordCount + localWordCount, config: config)
+                if localWordCount - lastReported > 10000 {
+                    reportChunkWords(localWordCount - lastReported)
+                    lastReported = localWordCount
+                }
+
+                // 3b) For each position in the sentence, run the CBOW or skip-gram update.
+                for sentencePosition in 0..<sentenceLength {
+                    let word = sen[sentencePosition]
+
+                    // Zero the hidden accumulators. ref: word2vec.c lines 431-432
+                    for c in 0..<vectorSize { neu1[c] = 0 }
+                    for c in 0..<vectorSize { neu1e[c] = 0 }
+
+                    // Random window shrink b in [0, window). ref: word2vec.c lines 433-434
+                    nextRandom = nextRandom &* 25214903917 &+ 11
+                    let b = Int(nextRandom % UInt64(config.window))
+
+                    if config.useCBOW {
+                        trainCBOW(word: word, b: b, window: config.window, negative: config.negative,
+                                  sentencePosition: sentencePosition, sentenceLength: sentenceLength,
+                                  sen: sen, vocabSize: config.vocabSize, alpha: Float(alpha),
+                                  unigramTable: unigramTable, nextRandom: &nextRandom,
+                                  syn0: syn0, syn1neg: syn1neg, expTable: expp,
+                                  neu1: neu1, neu1e: neu1e)
+                    } else {
+                        trainSkipGram(word: word, b: b, window: config.window, negative: config.negative,
+                                      sentencePosition: sentencePosition, sentenceLength: sentenceLength,
+                                      sen: sen, vocabSize: config.vocabSize, alpha: Float(alpha),
+                                      unigramTable: unigramTable, nextRandom: &nextRandom,
+                                      syn0: syn0, syn1neg: syn1neg, expTable: expp,
+                                      neu1e: neu1e)
+                    }
+                }
+            }
+
+            if localWordCount - lastReported > 0 {
+                reportChunkWords(localWordCount - lastReported)
+            }
+        }
+
+        return localWordCount
+    }
+
+    /// Alpha decay as a pure function of words processed so far. ref: word2vec.c lines 391-394
+    private func deterministicAlpha(processed: Int, config: TrainingConfig) -> Double {
+        var alpha = config.startingAlpha * (1 - Double(processed) / Double(config.alphaDenominator))
+        if alpha < config.startingAlpha * 0.0001 { alpha = config.startingAlpha * 0.0001 }
+        return alpha
+    }
+
+    // MARK: - Hogwild training (fast, lock-free, not run-to-run reproducible)
+
+    /// Original Hogwild path: all workers update the shared weights lock-free. ref: word2vec.c lines 374-555
+    private func trainHogwild(config: TrainingConfig, vocab: [VocabWord],
+                              tokenizedSentences: [[Int]], unigramTable: [Int32],
+                              syn0: inout [Float], syn1neg: inout [Float],
+                              progress: ((Double) -> Void)?) {
+        let progressCounter = TrainingProgressCounter()
+
+        syn0.withUnsafeMutableBufferPointer { syn0Buf in
+        syn1neg.withUnsafeMutableBufferPointer { syn1Buf in
+            let syn0p = syn0Buf.baseAddress!
+            let syn1p = syn1Buf.baseAddress!
+
+            DispatchQueue.concurrentPerform(iterations: config.numThreads) { threadId in
+                var nextRandom = UInt64(threadId) // ref: word2vec.c line 378
+                var neu1 = [Float](repeating: 0, count: vectorSize)
+                var neu1e = [Float](repeating: 0, count: vectorSize)
+                var sen: [Int] = []
+
+                neu1.withUnsafeMutableBufferPointer { neu1Buf in
+                neu1e.withUnsafeMutableBufferPointer { neu1eBuf in
+                    let neu1p = neu1Buf.baseAddress!
+                    let neu1ep = neu1eBuf.baseAddress!
+
+                    // `local_iter` belongs to each thread in the C. ref: word2vec.c line 377
+                    for epoch in 0..<config.iterCount {
+                        _ = runEpochChunk(
+                            threadId: threadId, epoch: epoch, config: config, vocab: vocab,
+                            tokenizedSentences: tokenizedSentences, unigramTable: unigramTable,
+                            nextRandom: &nextRandom, syn0: syn0p, syn1neg: syn1p,
+                            neu1: neu1p, neu1e: neu1ep, sen: &sen,
+                            reportChunkWords: { chunkWords in
+                                progressCounter.add(
+                                    chunkWords, denominator: config.alphaDenominator,
+                                    totalTrainWords: config.totalTrainWords, progress: progress)
+                            })
+                    }
+                }}
+            }
+        }}
+    }
+
+    // MARK: - Deterministic training (synchronous SGD, bit-exact run-to-run)
+
+    /// Bit-exact reproducible path (README: "Deterministic parallel training"). Each worker trains
+    /// on a **private copy** of `syn0`/`syn1neg`, so it sees only its own updates during an epoch and
+    /// never races another worker. At each epoch barrier the per-worker deltas (private − snapshot)
+    /// are summed into the shared weights **in fixed thread order 0,1,2,…**. Float addition isn't
+    /// associative, so the fixed order is what makes the merged result identical on every run.
+    private func trainDeterministic(config: TrainingConfig, vocab: [VocabWord],
+                                    tokenizedSentences: [[Int]], unigramTable: [Int32],
+                                    syn0: inout [Float], syn1neg: inout [Float],
+                                    progress: ((Double) -> Void)?) {
+        let numThreads = config.numThreads
+        let matrixCount = config.vocabSize * vectorSize
+        let progressCounter = TrainingProgressCounter()
+
+        // Per-worker private weight copies, flattened into one contiguous buffer each so workers can
+        // address disjoint slices through raw pointers (concurrent access to distinct regions of one
+        // buffer is safe; concurrent CoW access to an [[Float]] of independent arrays is not). Slice
+        // `t` is `[t*matrixCount ..< (t+1)*matrixCount)`. Reused across epochs; refilled from the
+        // shared snapshot at the start of every epoch so each epoch starts from the merged model.
+        var privateSyn0 = [Float](repeating: 0, count: numThreads * matrixCount)
+        var privateSyn1 = [Float](repeating: 0, count: numThreads * matrixCount)
+
+        // Each worker's RNG state persists across epochs, seeded once from its thread id, exactly as
+        // the reference does across its `local_iter` loop. Stored in a shared buffer; each worker only
+        // ever touches its own disjoint element. ref: word2vec.c lines 377-378
+        var rngState = [UInt64](repeating: 0, count: numThreads)
+        for threadId in 0..<numThreads { rngState[threadId] = UInt64(threadId) }
+
+        privateSyn0.withUnsafeMutableBufferPointer { priv0Buf in
+        privateSyn1.withUnsafeMutableBufferPointer { priv1Buf in
+        rngState.withUnsafeMutableBufferPointer { rngBuf in
+            let priv0Base = priv0Buf.baseAddress!
+            let priv1Base = priv1Buf.baseAddress!
+            let rngBase = rngBuf.baseAddress!
+
+            for epoch in 0..<config.iterCount {
+                // Snapshot the shared weights so every worker reads the SAME epoch-start model.
+                let snapshot0 = syn0
+                let snapshot1 = syn1neg
+
+                snapshot0.withUnsafeBufferPointer { snap0 in
+                snapshot1.withUnsafeBufferPointer { snap1 in
+                    let snap0p = snap0.baseAddress!
+                    let snap1p = snap1.baseAddress!
+
+                    DispatchQueue.concurrentPerform(iterations: numThreads) { threadId in
+                        let priv0p = priv0Base + threadId * matrixCount
+                        let priv1p = priv1Base + threadId * matrixCount
+                        // Start this epoch from the shared snapshot: private = snapshot.
+                        priv0p.update(from: snap0p, count: matrixCount)
+                        priv1p.update(from: snap1p, count: matrixCount)
+
+                        var nextRandom = rngBase[threadId]
+                        var neu1 = [Float](repeating: 0, count: vectorSize)
+                        var neu1e = [Float](repeating: 0, count: vectorSize)
+                        var sen: [Int] = []
+
+                        neu1.withUnsafeMutableBufferPointer { neu1Buf in
+                        neu1e.withUnsafeMutableBufferPointer { neu1eBuf in
+                            _ = runEpochChunk(
+                                threadId: threadId, epoch: epoch, config: config, vocab: vocab,
+                                tokenizedSentences: tokenizedSentences, unigramTable: unigramTable,
+                                nextRandom: &nextRandom, syn0: priv0p, syn1neg: priv1p,
+                                neu1: neu1Buf.baseAddress!, neu1e: neu1eBuf.baseAddress!, sen: &sen,
+                                // Intra-epoch progress. Safe to report from workers: the counter only
+                                // drives the UI fraction here — alpha is computed deterministically, so
+                                // this does NOT feed back into the trained weights.
+                                reportChunkWords: { chunkWords in
+                                    progressCounter.add(
+                                        chunkWords, denominator: config.alphaDenominator,
+                                        totalTrainWords: config.totalTrainWords, progress: progress)
+                                })
+                        }}
+                        rngBase[threadId] = nextRandom // carry this worker's RNG into the next epoch
+                    }
+                }}
+
+                // Deterministic reduction: shared += sum over threads of (private − snapshot), summed
+                // in fixed thread order. Because each worker's private matrix already equals
+                // snapshot + its own delta, adding (private − snapshot) for threads 0,1,2,… in order
+                // yields a result identical on every run regardless of how the workers were scheduled.
+                syn0.withUnsafeMutableBufferPointer { shared0 in
+                syn1neg.withUnsafeMutableBufferPointer { shared1 in
+                    let shared0p = shared0.baseAddress!
+                    let shared1p = shared1.baseAddress!
+                    snapshot0.withUnsafeBufferPointer { snap0 in
+                    snapshot1.withUnsafeBufferPointer { snap1 in
+                        let snap0p = snap0.baseAddress!
+                        let snap1p = snap1.baseAddress!
+                        for threadId in 0..<numThreads {
+                            accumulateDelta(shared: shared0p, priv: priv0Base + threadId * matrixCount,
+                                            snapshot: snap0p, count: matrixCount)
+                            accumulateDelta(shared: shared1p, priv: priv1Base + threadId * matrixCount,
+                                            snapshot: snap1p, count: matrixCount)
+                        }
+                    }}
+                }}
+                // Progress was reported incrementally by the workers above; nothing to add here.
+            }
+        }}}
+    }
+
+    /// `shared[i] += priv[i] - snapshot[i]` for every element. Called once per thread per matrix in
+    /// fixed thread order to keep the reduction bit-exact. `delta = priv - snapshot; shared += delta`.
+    private func accumulateDelta(shared: UnsafeMutablePointer<Float>, priv: UnsafePointer<Float>,
+                                 snapshot: UnsafePointer<Float>, count: Int) {
+        for i in 0..<count {
+            shared[i] += priv[i] - snapshot[i]
+        }
     }
 
     // MARK: - CBOW update (ref: word2vec.c lines 435-494)
