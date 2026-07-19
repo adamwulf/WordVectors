@@ -40,7 +40,7 @@ final class Word2VecTrainingTests: XCTestCase {
 
         var lastProgress: Double = -1
         let embeddings = trainer.train(sentences: syntheticCorpus()) { p in
-            // Progress must be monotonically non-decreasing and within bounds.
+            // Parallel workers may deliver updates out of order, but progress stays bounded.
             XCTAssertGreaterThanOrEqual(p, 0)
             XCTAssertLessThanOrEqual(p, 1)
             lastProgress = p
@@ -122,7 +122,7 @@ final class Word2VecTrainingTests: XCTestCase {
         XCTAssertFalse(embeddings.contains("rare"))
     }
 
-    func testDeterministicWithSameSeed() {
+    func testTrainingIsStableAcrossRuns() {
         var params = Word2VecParameters()
         params.vectorSize = 15
         params.iterations = 10
@@ -134,9 +134,41 @@ final class Word2VecTrainingTests: XCTestCase {
         let corpus = syntheticCorpus()
         let a = Word2Vec(parameters: params).train(sentences: corpus, progress: nil)
         let b = Word2Vec(parameters: params).train(sentences: corpus, progress: nil)
+        var initializationParams = params
+        initializationParams.iterations = 0
+        let initialized = Word2Vec(parameters: initializationParams).train(sentences: corpus, progress: nil)
 
-        // Same seed + same corpus + single-threaded => identical vectors.
-        XCTAssertEqual(a.vector(for: "cat"), b.vector(for: "cat"))
-        XCTAssertEqual(a.vector(for: "king"), b.vector(for: "king"))
+        XCTAssertEqual(a.vocabulary, b.vocabulary)
+        XCTAssertEqual(a.vectorSize, b.vectorSize)
+
+        let maximumSquaredDisplacement = a.vocabulary.compactMap { word -> Double? in
+            guard let trained = a.vector(for: word), let initial = initialized.vector(for: word) else {
+                return nil
+            }
+            return zip(trained, initial).reduce(0.0) {
+                let difference = Double($1.0 - $1.1)
+                return $0 + difference * difference
+            }
+        }.max() ?? 0
+        XCTAssertGreaterThan(maximumSquaredDisplacement, 0.0001, "Training must update the seeded vectors")
+
+        // Hogwild intentionally gives up run-to-run bit-exactness. Verify instead that the
+        // learned vectors retain the same aggregate geometry across different interleavings.
+        let cosineSimilarities = a.vocabulary.compactMap { word -> Double? in
+            guard let lhs = a.vector(for: word), let rhs = b.vector(for: word) else { return nil }
+            XCTAssertEqual(lhs.count, params.vectorSize)
+            XCTAssertEqual(rhs.count, params.vectorSize)
+
+            let dot = zip(lhs, rhs).reduce(0.0) { $0 + Double($1.0 * $1.1) }
+            let lhsMagnitude = sqrt(lhs.reduce(0.0) { $0 + Double($1 * $1) })
+            let rhsMagnitude = sqrt(rhs.reduce(0.0) { $0 + Double($1 * $1) })
+            guard lhsMagnitude > 0, rhsMagnitude > 0 else { return nil }
+            return dot / (lhsMagnitude * rhsMagnitude)
+        }
+
+        XCTAssertEqual(cosineSimilarities.count, a.vocabulary.count)
+        let averageCosine = cosineSimilarities.reduce(0, +) / Double(cosineSimilarities.count)
+        // The full corpus measures about 0.887 run-to-run, so 0.85 is its calibrated floor.
+        XCTAssertGreaterThan(averageCosine, 0.85)
     }
 }

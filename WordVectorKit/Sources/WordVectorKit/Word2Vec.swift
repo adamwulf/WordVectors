@@ -23,9 +23,31 @@
 //  entry in our vocabulary.
 
 import Foundation
+import Accelerate
+
+/// Shared progress state from `TrainModelThread`. Only this scalar is synchronized; the model
+/// weights intentionally remain lock-free. ref: word2vec.c lines 387-399
+private final class TrainingProgressCounter {
+    private let lock = NSLock()
+    private var wordCountActual = 0
+
+    func add(_ count: Int, startingAlpha: Double, denominator: Int,
+             totalTrainWords: Int, progress: ((Double) -> Void)?) -> Double {
+        lock.lock()
+        wordCountActual += count
+        var alpha = startingAlpha * (1 - Double(wordCountActual) / Double(denominator))
+        if alpha < startingAlpha * 0.0001 { alpha = startingAlpha * 0.0001 }
+        let fraction = min(1.0, Double(wordCountActual) / Double(totalTrainWords))
+        lock.unlock()
+
+        progress?(fraction)
+        return alpha
+    }
+}
 
 /// Pure-Swift, in-memory port of word2vec (CBOW + skip-gram, negative sampling only;
-/// hierarchical softmax is intentionally omitted). Single-threaded for correctness.
+/// hierarchical softmax is intentionally omitted). Training uses the reference implementation's
+/// Hogwild parallelism: workers update shared weights asynchronously without locks.
 public final class Word2Vec {
 
     // MARK: - Ported constants (ref: word2vec.c lines 22-23, 49)
@@ -93,7 +115,8 @@ public final class Word2Vec {
     // MARK: - Training
 
     /// Trains on already-preprocessed sentences (each element = one space-tokenized sentence).
-    /// `progress` is called periodically on the calling thread with a value in `0.0...1.0`.
+    /// `progress` is called serially from training worker threads with a value in `0.0...1.0`.
+    /// Callers that update UI must dispatch to the main thread.
     public func train(sentences: [String], progress: ((Double) -> Void)?) -> WordEmbeddings {
         // 1) Build vocabulary with counts, apply min-count, sort by frequency descending.
         let (vocab, wordIndex) = buildVocabulary(sentences: sentences)
@@ -144,22 +167,11 @@ public final class Word2Vec {
 
         // 4) Training loop — port of TrainModelThread. ref: word2vec.c lines 374-555
         let startingAlpha = params.initialAlpha
-        var alpha = startingAlpha
         let iterCount = params.iterations
         // Total words the C would process across all epochs (iter * train_words).
         let totalTrainWords = max(1, iterCount * trainWords)
-
-        // Per-thread RNG in the C is seeded from the thread id (0 for a single thread).
-        // ref: word2vec.c line 378 — `next_random = (long long)id;`
-        var nextRandom: UInt64 = 0
-
-        var wordCountActual = 0
-        var wordCount = 0
-        var lastWordCount = 0
-
-        // Scratch buffers reused across updates (ref: word2vec.c lines 382-383).
-        var neu1 = [Float](repeating: 0, count: vectorSize)
-        var neu1e = [Float](repeating: 0, count: vectorSize)
+        let numThreads = max(1, ProcessInfo.processInfo.activeProcessorCount)
+        let progressCounter = TrainingProgressCounter()
 
         // Clamp window to >= 1: `nextRandom % UInt64(window)` would trap on window == 0.
         // A window of 0 has no context anyway, so 1 is the smallest meaningful value.
@@ -167,83 +179,125 @@ public final class Word2Vec {
         let negative = params.negativeSamples
         let sample = params.subsample
         let useCBOW = params.useCBOW
+        let trainWordsDouble = Double(trainWords)
+        let sampleTrainWords = sample * trainWordsDouble
 
         syn0.withUnsafeMutableBufferPointer { syn0Buf in
         syn1neg.withUnsafeMutableBufferPointer { syn1Buf in
         expTable.withUnsafeBufferPointer { expBuf in
-        neu1.withUnsafeMutableBufferPointer { neu1Buf in
-        neu1e.withUnsafeMutableBufferPointer { neu1eBuf in
 
             let syn0p = syn0Buf.baseAddress!
             let syn1p = syn1Buf.baseAddress!
             let expp = expBuf.baseAddress!
-            let neu1p = neu1Buf.baseAddress!
-            let neu1ep = neu1eBuf.baseAddress!
 
-            for _ in 0..<iterCount {
-                for sentence in tokenizedSentences {
-                    // 3a) Apply subsampling to build this sentence's kept-token list.
-                    //     ref: word2vec.c lines 407-412
-                    var sen: [Int] = []
-                    sen.reserveCapacity(sentence.count)
-                    for word in sentence {
-                        wordCount += 1
-                        if sample > 0 {
-                            let cn = Double(vocab[word].cn)
-                            // ran = (sqrt(cn / (sample*train_words)) + 1) * (sample*train_words) / cn
-                            let ran = (sqrt(cn / (sample * Double(trainWords))) + 1) * (sample * Double(trainWords)) / cn
-                            nextRandom = nextRandom &* 25214903917 &+ 11
-                            if ran < Double(nextRandom & 0xFFFF) / Double(65536) {
-                                continue // discard this frequent word
+            DispatchQueue.concurrentPerform(iterations: numThreads) { threadId in
+                // Each worker owns the same local state as TrainModelThread.
+                // ref: word2vec.c lines 376-383
+                var nextRandom = UInt64(threadId) // ref: word2vec.c line 378
+                var wordCount = 0
+                var lastWordCount = 0
+                var alpha = startingAlpha
+                var neu1 = [Float](repeating: 0, count: vectorSize)
+                var neu1e = [Float](repeating: 0, count: vectorSize)
+                var sen: [Int] = []
+
+                // Contiguous sentence chunks are the in-memory equivalent of the C port's
+                // per-thread file offsets. ref: word2vec.c lines 385-386
+                let chunkStart = tokenizedSentences.count * threadId / numThreads
+                let chunkEnd = tokenizedSentences.count * (threadId + 1) / numThreads
+
+                neu1.withUnsafeMutableBufferPointer { neu1Buf in
+                neu1e.withUnsafeMutableBufferPointer { neu1eBuf in
+                    let neu1p = neu1Buf.baseAddress!
+                    let neu1ep = neu1eBuf.baseAddress!
+
+                    // `local_iter` belongs to each thread in the C. ref: word2vec.c line 377
+                    for _ in 0..<iterCount {
+                        for sentenceIndex in chunkStart..<chunkEnd {
+                            let sentence = tokenizedSentences[sentenceIndex]
+
+                            // 3a) Apply subsampling to build this sentence's kept-token list.
+                            //     ref: word2vec.c lines 407-412
+                            sen.removeAll(keepingCapacity: true)
+                            sen.reserveCapacity(sentence.count)
+                            for word in sentence {
+                                wordCount += 1
+                                if sample > 0 {
+                                    let cn = Double(vocab[word].cn)
+                                    // ran = (sqrt(cn / (sample*train_words)) + 1) * (sample*train_words) / cn
+                                    let ran = (sqrt(cn / sampleTrainWords) + 1) * sampleTrainWords / cn
+                                    nextRandom = nextRandom &* 25214903917 &+ 11
+                                    if ran < Double(nextRandom & 0xFFFF) / Double(65536) {
+                                        continue // discard this frequent word
+                                    }
+                                }
+                                sen.append(word)
+                            }
+
+                            let sentenceLength = sen.count
+
+                            // Periodic alpha decay + progress. ref: word2vec.c lines 387-399
+                            if wordCount - lastWordCount > 10000 {
+                                alpha = progressCounter.add(
+                                    wordCount - lastWordCount,
+                                    startingAlpha: startingAlpha,
+                                    denominator: iterCount * trainWords + 1,
+                                    totalTrainWords: totalTrainWords,
+                                    progress: progress
+                                )
+                                lastWordCount = wordCount
+                            }
+
+                            // 3b) For each position in the sentence, run the CBOW or skip-gram update.
+                            for sentencePosition in 0..<sentenceLength {
+                                let word = sen[sentencePosition]
+
+                                // Zero the hidden accumulators. ref: word2vec.c lines 431-432
+                                for c in 0..<vectorSize { neu1p[c] = 0 }
+                                for c in 0..<vectorSize { neu1ep[c] = 0 }
+
+                                // Random window shrink b in [0, window). ref: word2vec.c lines 433-434
+                                nextRandom = nextRandom &* 25214903917 &+ 11
+                                let b = Int(nextRandom % UInt64(window))
+
+                                if useCBOW {
+                                    trainCBOW(word: word, b: b, window: window, negative: negative,
+                                              sentencePosition: sentencePosition, sentenceLength: sentenceLength,
+                                              sen: sen, vocabSize: vocabSize, alpha: Float(alpha),
+                                              unigramTable: unigramTable, nextRandom: &nextRandom,
+                                              syn0: syn0p, syn1neg: syn1p, expTable: expp,
+                                              neu1: neu1p, neu1e: neu1ep)
+                                } else {
+                                    trainSkipGram(word: word, b: b, window: window, negative: negative,
+                                                  sentencePosition: sentencePosition, sentenceLength: sentenceLength,
+                                                  sen: sen, vocabSize: vocabSize, alpha: Float(alpha),
+                                                  unigramTable: unigramTable, nextRandom: &nextRandom,
+                                                  syn0: syn0p, syn1neg: syn1p, expTable: expp,
+                                                  neu1e: neu1ep)
+                                }
                             }
                         }
-                        sen.append(word)
-                    }
 
-                    let sentenceLength = sen.count
-
-                    // Periodic alpha decay + progress. ref: word2vec.c lines 387-399
-                    if wordCount - lastWordCount > 10000 {
-                        wordCountActual += wordCount - lastWordCount
-                        lastWordCount = wordCount
-                        // alpha = starting_alpha * (1 - word_count_actual / (iter*train_words + 1))
-                        alpha = startingAlpha * (1 - Double(wordCountActual) / Double(iterCount * trainWords + 1))
-                        if alpha < startingAlpha * 0.0001 { alpha = startingAlpha * 0.0001 }
-                        progress?(min(1.0, Double(wordCountActual) / Double(totalTrainWords)))
-                    }
-
-                    // 3b) For each position in the sentence, run the CBOW or skip-gram update.
-                    for sentencePosition in 0..<sentenceLength {
-                        let word = sen[sentencePosition]
-
-                        // Zero the hidden accumulators. ref: word2vec.c lines 431-432
-                        for c in 0..<vectorSize { neu1p[c] = 0 }
-                        for c in 0..<vectorSize { neu1ep[c] = 0 }
-
-                        // Random window shrink b in [0, window). ref: word2vec.c lines 433-434
-                        nextRandom = nextRandom &* 25214903917 &+ 11
-                        let b = Int(nextRandom % UInt64(window))
-
-                        if useCBOW {
-                            trainCBOW(word: word, b: b, window: window, negative: negative,
-                                      sentencePosition: sentencePosition, sentenceLength: sentenceLength,
-                                      sen: sen, vocabSize: vocabSize, alpha: Float(alpha),
-                                      unigramTable: unigramTable, nextRandom: &nextRandom,
-                                      syn0: syn0p, syn1neg: syn1p, expTable: expp,
-                                      neu1: neu1p, neu1e: neu1ep)
-                        } else {
-                            trainSkipGram(word: word, b: b, window: window, negative: negative,
-                                          sentencePosition: sentencePosition, sentenceLength: sentenceLength,
-                                          sen: sen, vocabSize: vocabSize, alpha: Float(alpha),
-                                          unigramTable: unigramTable, nextRandom: &nextRandom,
-                                          syn0: syn0p, syn1neg: syn1p, expTable: expp,
-                                          neu1e: neu1ep)
+                        // Flush this worker's remaining count before its next local epoch.
+                        // ref: word2vec.c lines 421-428
+                        let remainder = wordCount - lastWordCount
+                        if remainder > 0 {
+                            alpha = progressCounter.add(
+                                remainder,
+                                startingAlpha: startingAlpha,
+                                denominator: iterCount * trainWords + 1,
+                                totalTrainWords: totalTrainWords,
+                                progress: progress
+                            )
                         }
+                        wordCount = 0
+                        lastWordCount = 0
                     }
-                }
+
+                }}
             }
 
-        }}}}}
+        }}}
 
         progress?(1.0)
 
@@ -275,7 +329,7 @@ public final class Word2Vec {
                 if c >= 0 && c < sentenceLength {
                     let lastWord = sen[c]
                     let base = lastWord * layer1Size
-                    for j in 0..<layer1Size { neu1[j] += syn0[base + j] }
+                    vDSP_vadd(neu1, 1, syn0 + base, 1, neu1, 1, vDSP_Length(layer1Size))
                     cw += 1
                 }
             }
@@ -285,7 +339,8 @@ public final class Word2Vec {
         guard cw > 0 else { return }
 
         // Average the context vectors. ref: word2vec.c line 448
-        for j in 0..<layer1Size { neu1[j] /= Float(cw) }
+        var cwFloat = Float(cw)
+        vDSP_vsdiv(neu1, 1, &cwFloat, neu1, 1, vDSP_Length(layer1Size))
 
         // NEGATIVE SAMPLING. ref: word2vec.c lines 465-484
         for d in 0..<(negative + 1) {
@@ -309,11 +364,11 @@ public final class Word2Vec {
 
             // f = dot(neu1, syn1neg[target]) ref: word2vec.c lines 477-478
             var f: Float = 0
-            for c in 0..<layer1Size { f += neu1[c] * syn1neg[l2 + c] }
+            vDSP_dotpr(neu1, 1, syn1neg + l2, 1, &f, vDSP_Length(layer1Size))
 
             // g = (label - sigmoid(f)) * alpha, with the clipped-exp-table lookup.
             // ref: word2vec.c lines 479-481
-            let g: Float
+            var g: Float
             if f > Word2Vec.maxExp {
                 g = (label - 1) * alpha
             } else if f < -Word2Vec.maxExp {
@@ -324,8 +379,8 @@ public final class Word2Vec {
             }
 
             // Accumulate hidden error and update output weights. ref: word2vec.c lines 482-483
-            for c in 0..<layer1Size { neu1e[c] += g * syn1neg[l2 + c] }
-            for c in 0..<layer1Size { syn1neg[l2 + c] += g * neu1[c] }
+            vDSP_vsma(syn1neg + l2, 1, &g, neu1e, 1, neu1e, 1, vDSP_Length(layer1Size))
+            vDSP_vsma(neu1, 1, &g, syn1neg + l2, 1, syn1neg + l2, 1, vDSP_Length(layer1Size))
         }
 
         // hidden -> in: apply the accumulated error to each context word. ref: word2vec.c lines 486-493
@@ -336,7 +391,7 @@ public final class Word2Vec {
                 if c >= 0 && c < sentenceLength {
                     let lastWord = sen[c]
                     let base = lastWord * layer1Size
-                    for j in 0..<layer1Size { syn0[base + j] += neu1e[j] }
+                    vDSP_vadd(syn0 + base, 1, neu1e, 1, syn0 + base, 1, vDSP_Length(layer1Size))
                 }
             }
             a += 1
@@ -389,10 +444,10 @@ public final class Word2Vec {
 
                         // f = dot(syn0[context], syn1neg[target]) ref: word2vec.c lines 533-534
                         var f: Float = 0
-                        for j in 0..<layer1Size { f += syn0[l1 + j] * syn1neg[l2 + j] }
+                        vDSP_dotpr(syn0 + l1, 1, syn1neg + l2, 1, &f, vDSP_Length(layer1Size))
 
                         // g = (label - sigmoid(f)) * alpha. ref: word2vec.c lines 535-537
-                        let g: Float
+                        var g: Float
                         if f > Word2Vec.maxExp {
                             g = (label - 1) * alpha
                         } else if f < -Word2Vec.maxExp {
@@ -403,13 +458,13 @@ public final class Word2Vec {
                         }
 
                         // Accumulate error and update output weights. ref: word2vec.c lines 538-539
-                        for j in 0..<layer1Size { neu1e[j] += g * syn1neg[l2 + j] }
-                        for j in 0..<layer1Size { syn1neg[l2 + j] += g * syn0[l1 + j] }
+                        vDSP_vsma(syn1neg + l2, 1, &g, neu1e, 1, neu1e, 1, vDSP_Length(layer1Size))
+                        vDSP_vsma(syn0 + l1, 1, &g, syn1neg + l2, 1, syn1neg + l2, 1, vDSP_Length(layer1Size))
                     }
 
                     // Learn input -> hidden: apply accumulated error to the context word.
                     // ref: word2vec.c line 542
-                    for j in 0..<layer1Size { syn0[l1 + j] += neu1e[j] }
+                    vDSP_vadd(syn0 + l1, 1, neu1e, 1, syn0 + l1, 1, vDSP_Length(layer1Size))
                 }
             }
             a += 1

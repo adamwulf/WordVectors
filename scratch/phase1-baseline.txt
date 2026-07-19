@@ -1,0 +1,6 @@
+Phase 1 unmodified-training baseline
+Command: swift run --disable-sandbox -c release --package-path WordVectorKit w2v-bench <repo>/WordVectors/Corpus
+Wall-clock train() time: 73.093 seconds
+Checksum word: the
+Checksum: -1.441858
+Vocabulary count: 16047
