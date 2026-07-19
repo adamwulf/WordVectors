@@ -23,7 +23,7 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         ModelStore.shared.bootstrap()
     }
 
-    /// Builds the three-tab UI: Train, Nearest words, and Word algebra.
+    /// Builds the three-tab UI: Train, Explore, and Word Algebra.
     private static func makeRootViewController() -> UIViewController {
         let tabBar = UITabBarController()
 
@@ -34,10 +34,10 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
             selectedImage: nil
         )
 
-        let nearest = NearestViewController()
-        nearest.tabBarItem = UITabBarItem(
-            title: "Nearest",
-            image: UIImage(systemName: "magnifyingglass"),
+        let explore = GraphViewController()
+        explore.tabBarItem = UITabBarItem(
+            title: "Explore",
+            image: UIImage(systemName: "chart.dots.scatter"),
             selectedImage: nil
         )
 
@@ -50,7 +50,7 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
         tabBar.viewControllers = [
             UINavigationController(rootViewController: train),
-            UINavigationController(rootViewController: nearest),
+            UINavigationController(rootViewController: explore),
             UINavigationController(rootViewController: analogy),
         ]
         return tabBar
