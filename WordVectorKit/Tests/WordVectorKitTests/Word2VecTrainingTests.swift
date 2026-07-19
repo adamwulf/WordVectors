@@ -122,7 +122,7 @@ final class Word2VecTrainingTests: XCTestCase {
         XCTAssertFalse(embeddings.contains("rare"))
     }
 
-    func testDeterministicWithSameSeed() {
+    func testTrainingIsStableAcrossRuns() {
         var params = Word2VecParameters()
         params.vectorSize = 15
         params.iterations = 10
@@ -135,8 +135,25 @@ final class Word2VecTrainingTests: XCTestCase {
         let a = Word2Vec(parameters: params).train(sentences: corpus, progress: nil)
         let b = Word2Vec(parameters: params).train(sentences: corpus, progress: nil)
 
-        // Same seed + same corpus + single-threaded => identical vectors.
-        XCTAssertEqual(a.vector(for: "cat"), b.vector(for: "cat"))
-        XCTAssertEqual(a.vector(for: "king"), b.vector(for: "king"))
+        XCTAssertEqual(a.vocabulary, b.vocabulary)
+        XCTAssertEqual(a.vectorSize, b.vectorSize)
+
+        // Hogwild intentionally gives up run-to-run bit-exactness. Verify instead that the
+        // learned vectors retain the same aggregate geometry across different interleavings.
+        let cosineSimilarities = a.vocabulary.compactMap { word -> Double? in
+            guard let lhs = a.vector(for: word), let rhs = b.vector(for: word) else { return nil }
+            XCTAssertEqual(lhs.count, params.vectorSize)
+            XCTAssertEqual(rhs.count, params.vectorSize)
+
+            let dot = zip(lhs, rhs).reduce(0.0) { $0 + Double($1.0 * $1.1) }
+            let lhsMagnitude = sqrt(lhs.reduce(0.0) { $0 + Double($1 * $1) })
+            let rhsMagnitude = sqrt(rhs.reduce(0.0) { $0 + Double($1 * $1) })
+            guard lhsMagnitude > 0, rhsMagnitude > 0 else { return nil }
+            return dot / (lhsMagnitude * rhsMagnitude)
+        }
+
+        XCTAssertEqual(cosineSimilarities.count, a.vocabulary.count)
+        let averageCosine = cosineSimilarities.reduce(0, +) / Double(cosineSimilarities.count)
+        XCTAssertGreaterThan(averageCosine, 0.9)
     }
 }

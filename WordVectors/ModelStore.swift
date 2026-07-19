@@ -265,7 +265,7 @@ final class ModelStore {
     }
 
     /// Pure, main-actor-free training. Loads the selected corpus files from the app bundle,
-    /// preprocesses them, and runs Word2Vec. `progress` is invoked on the calling thread.
+    /// preprocesses them, and runs Word2Vec. `progress` is invoked on training worker threads.
     nonisolated private static func performTraining(
         stems: [String],
         parameters: Word2VecParameters,
