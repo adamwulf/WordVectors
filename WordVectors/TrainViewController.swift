@@ -486,8 +486,17 @@ private final class ParameterStepperRow: UIView {
         labels.axis = .vertical
         labels.spacing = 2
         labels.alignment = .leading
+        // Hug the label text so it doesn't stretch and shove the controls to the far edge —
+        // the value + stepper should sit just to the right of the title, not across the row.
+        labels.setContentHuggingPriority(.required, for: .horizontal)
 
-        let row = UIStackView(arrangedSubviews: [labels, valueLabel, stepper])
+        // A flexible spacer that absorbs the row's extra width, keeping the labels, value, and
+        // stepper grouped together on the leading side instead of spread across the whole row.
+        let spacer = UIView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let row = UIStackView(arrangedSubviews: [labels, valueLabel, stepper, spacer])
         row.axis = .horizontal
         row.spacing = 12
         row.alignment = .center
