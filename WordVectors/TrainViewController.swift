@@ -40,8 +40,9 @@ final class TrainViewController: UIViewController {
     private let detailLabel = UILabel()
     private let selectionHintLabel = UILabel()
 
-    /// Scrolls the whole content so a long book list stays reachable on small screens.
-    private let scrollView = UIScrollView()
+    /// Scrolls only the book list, so the corpus/hyperparameter headers, the hyperparameter
+    /// column, and the Train/Retrain controls stay fixed while a long book list scrolls.
+    private let booksScrollView = UIScrollView()
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -183,9 +184,30 @@ final class TrainViewController: UIViewController {
         corpusHeader.spacing = 4
         corpusHeader.alignment = .fill
 
+        // Only the book list scrolls. The stack of rows is pinned to the scroll view's content
+        // guide and matched to its frame width, so it scrolls vertically and never horizontally.
+        booksStack.translatesAutoresizingMaskIntoConstraints = false
+        booksScrollView.translatesAutoresizingMaskIntoConstraints = false
+        booksScrollView.showsHorizontalScrollIndicator = false
+        // The book list is the one element that stretches to absorb spare vertical space; give it
+        // the lowest hugging/compression-resistance so it — and not the fixed rows — grows or
+        // shrinks as the window resizes.
+        booksScrollView.setContentHuggingPriority(.defaultLow, for: .vertical)
+        booksScrollView.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        booksScrollView.addSubview(booksStack)
+        let booksContent = booksScrollView.contentLayoutGuide
+        let booksFrame = booksScrollView.frameLayoutGuide
+        NSLayoutConstraint.activate([
+            booksStack.topAnchor.constraint(equalTo: booksContent.topAnchor),
+            booksStack.bottomAnchor.constraint(equalTo: booksContent.bottomAnchor),
+            booksStack.leadingAnchor.constraint(equalTo: booksContent.leadingAnchor),
+            booksStack.trailingAnchor.constraint(equalTo: booksContent.trailingAnchor),
+            booksStack.widthAnchor.constraint(equalTo: booksFrame.widthAnchor),
+        ])
+
         let corpusColumn = UIStackView(arrangedSubviews: [
             corpusHeader,
-            booksStack,
+            booksScrollView,
             selectionHintLabel,
         ])
         corpusColumn.axis = .vertical
@@ -200,13 +222,28 @@ final class TrainViewController: UIViewController {
         paramsColumn.axis = .vertical
         paramsColumn.spacing = 16
         paramsColumn.alignment = .fill
+        // The hyperparameter column hugs its content and pins to the top so it doesn't stretch
+        // to the corpus column's full (scrollable) height.
+        paramsColumn.setContentHuggingPriority(.required, for: .vertical)
 
-        let columns = UIStackView(arrangedSubviews: [corpusColumn, paramsColumn])
+        // Wrap the fixed-height params column so the shorter of the two columns sits at the top
+        // rather than being stretched to match the scrollable corpus column.
+        let paramsContainer = UIStackView(arrangedSubviews: [paramsColumn, UIView()])
+        paramsContainer.axis = .vertical
+        paramsContainer.alignment = .fill
+
+        let columns = UIStackView(arrangedSubviews: [corpusColumn, paramsContainer])
         columns.axis = .horizontal
         columns.spacing = 24
-        columns.alignment = .top
+        columns.alignment = .fill
         columns.distribution = .fillEqually
+        // The columns row absorbs the main stack's spare vertical space (which the book list then
+        // fills), so the fixed labels and buttons keep their intrinsic heights.
+        columns.setContentHuggingPriority(.defaultLow, for: .vertical)
+        columns.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
 
+        // Fixed content: status header, the two columns (only the book list inside scrolls), and
+        // the Train/Retrain controls. Pinned to the safe area — the whole window no longer scrolls.
         let stack = UIStackView(arrangedSubviews: [
             statusLabel,
             columns,
@@ -222,24 +259,13 @@ final class TrainViewController: UIViewController {
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.setCustomSpacing(24, after: retrainButton)
 
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.addSubview(stack)
-        view.addSubview(scrollView)
+        view.addSubview(stack)
 
-        let content = scrollView.contentLayoutGuide
-        let frame = scrollView.frameLayoutGuide
         NSLayoutConstraint.activate([
-            scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
-            scrollView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
-
-            stack.topAnchor.constraint(greaterThanOrEqualTo: content.topAnchor, constant: 24),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -24),
-            stack.centerYAnchor.constraint(equalTo: content.centerYAnchor).withPriority(.defaultLow),
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
-            stack.widthAnchor.constraint(equalTo: frame.widthAnchor, constant: -48),
+            stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 24),
+            stack.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -24),
+            stack.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -24),
         ])
 
         refreshBookRows()
@@ -595,15 +621,5 @@ private extension UIFont {
             ]],
         ])
         return UIFont(descriptor: descriptor, size: pointSize)
-    }
-}
-
-// MARK: - Constraint helper
-
-private extension NSLayoutConstraint {
-    /// Fluent priority setter so a constraint can be created and prioritized inline.
-    func withPriority(_ priority: UILayoutPriority) -> NSLayoutConstraint {
-        self.priority = priority
-        return self
     }
 }
