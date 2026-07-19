@@ -28,6 +28,17 @@ public struct Word2VecParameters: Sendable, Codable {
     /// Seed for the linear-congruential RNG so results are reproducible.
     public var seed: UInt64 = 1
 
+    /// When `true`, training is **bit-exact reproducible run-to-run**; when `false` it uses
+    /// pure lock-free Hogwild (fastest, but vectors drift slightly between runs).
+    ///
+    /// The deterministic path is synchronous SGD: each worker trains on a private copy of the
+    /// weights and the per-worker deltas are reduced into the shared weights in fixed thread
+    /// order at every epoch boundary (float addition isn't associative, so a fixed order is what
+    /// makes the result identical every run). This removes the weight race entirely at the cost
+    /// of extra memory (a private `syn0`/`syn1neg` copy per worker) and a per-epoch sync barrier.
+    /// See the "Deterministic parallel training" section of the README.
+    public var deterministic: Bool = true
+
     /// Resolution of the unigram negative-sampling table (C: `table_size`).
     ///
     /// This is the number of slots the `cn^0.75` distribution is quantized into. A larger

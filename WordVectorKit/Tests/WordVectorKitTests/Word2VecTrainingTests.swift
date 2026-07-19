@@ -122,7 +122,11 @@ final class Word2VecTrainingTests: XCTestCase {
         XCTAssertFalse(embeddings.contains("rare"))
     }
 
-    func testTrainingIsStableAcrossRuns() {
+    /// The deterministic path (default) must produce **bit-identical** vectors on every run.
+    /// This is the guarantee the synchronous-SGD training exists to provide: workers train on
+    /// private weight copies and their deltas are merged in fixed thread order, so no lock-free
+    /// weight race can perturb the result between runs.
+    func testDeterministicTrainingIsBitExactAcrossRuns() {
         var params = Word2VecParameters()
         params.vectorSize = 15
         params.iterations = 10
@@ -130,6 +134,8 @@ final class Word2VecTrainingTests: XCTestCase {
         params.window = 3
         params.seed = 123
         params.unigramTableSize = Self.fastTableSize
+        // deterministic defaults to true; be explicit for the reader.
+        params.deterministic = true
 
         let corpus = syntheticCorpus()
         let a = Word2Vec(parameters: params).train(sentences: corpus, progress: nil)
@@ -152,13 +158,37 @@ final class Word2VecTrainingTests: XCTestCase {
         }.max() ?? 0
         XCTAssertGreaterThan(maximumSquaredDisplacement, 0.0001, "Training must update the seeded vectors")
 
-        // Hogwild intentionally gives up run-to-run bit-exactness. Verify instead that the
-        // learned vectors retain the same aggregate geometry across different interleavings.
+        // Every word's vector must be byte-for-byte identical between the two runs.
+        for word in a.vocabulary {
+            guard let lhs = a.vector(for: word), let rhs = b.vector(for: word) else {
+                XCTFail("Missing vector for \(word)")
+                continue
+            }
+            XCTAssertEqual(lhs, rhs, "Deterministic training must be bit-exact for '\(word)'")
+        }
+    }
+
+    /// The opt-in Hogwild path trades bit-exactness for speed. It should still train the corpus and
+    /// keep the same aggregate geometry run-to-run (high mean cosine), even though individual vectors
+    /// drift slightly between interleavings.
+    func testHogwildTrainingIsStableInGeometryAcrossRuns() {
+        var params = Word2VecParameters()
+        params.vectorSize = 15
+        params.iterations = 10
+        params.minCount = 1
+        params.window = 3
+        params.seed = 123
+        params.unigramTableSize = Self.fastTableSize
+        params.deterministic = false
+
+        let corpus = syntheticCorpus()
+        let a = Word2Vec(parameters: params).train(sentences: corpus, progress: nil)
+        let b = Word2Vec(parameters: params).train(sentences: corpus, progress: nil)
+
+        XCTAssertEqual(a.vocabulary, b.vocabulary)
+
         let cosineSimilarities = a.vocabulary.compactMap { word -> Double? in
             guard let lhs = a.vector(for: word), let rhs = b.vector(for: word) else { return nil }
-            XCTAssertEqual(lhs.count, params.vectorSize)
-            XCTAssertEqual(rhs.count, params.vectorSize)
-
             let dot = zip(lhs, rhs).reduce(0.0) { $0 + Double($1.0 * $1.1) }
             let lhsMagnitude = sqrt(lhs.reduce(0.0) { $0 + Double($1 * $1) })
             let rhsMagnitude = sqrt(rhs.reduce(0.0) { $0 + Double($1 * $1) })
