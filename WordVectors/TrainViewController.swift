@@ -44,6 +44,10 @@ final class TrainViewController: UIViewController {
     private let detailLabel = UILabel()
     private let selectionHintLabel = UILabel()
 
+    /// The book titles behind the "N books" line in the ready-state footer. Non-empty only
+    /// while a trained model is shown, which is exactly when tapping the footer lists them.
+    private var footerBookTitles: [String] = []
+
     /// Scrolls only the book list, so the corpus/hyperparameter headers, the hyperparameter
     /// column, and the Train/Retrain controls stay fixed while a long book list scrolls.
     private let booksScrollView = UIScrollView()
@@ -84,6 +88,12 @@ final class TrainViewController: UIViewController {
         detailLabel.textColor = .secondaryLabel
         detailLabel.numberOfLines = 0
         detailLabel.textAlignment = .center
+        // The footer's "N books" line is tappable to reveal the full title list — see
+        // `detailTapped`. The gesture is harmless in other states because it only acts when
+        // `footerBookTitles` is populated, which happens solely in the ready state.
+        detailLabel.isUserInteractionEnabled = true
+        detailLabel.addGestureRecognizer(
+            UITapGestureRecognizer(target: self, action: #selector(detailTapped)))
 
         var trainConfig = UIButton.Configuration.filled()
         trainConfig.title = "Train Model"
@@ -367,6 +377,9 @@ final class TrainViewController: UIViewController {
     // MARK: - State rendering
 
     private func render(_ state: ModelState) {
+        // Clear the tappable book list up front; only the ready state repopulates it (via
+        // `readyDetail`), so a tap can never surface titles from a prior model.
+        footerBookTitles = []
         switch state {
         case .idle:
             statusLabel.text = "No model yet"
@@ -429,13 +442,32 @@ final class TrainViewController: UIViewController {
                 ? "Cached · trained on \(info.scopeSummary) · \(info.sentenceCount) sentences"
                 : "Trained on \(info.scopeSummary) · \(info.sentenceCount) sentences"
             lines.append(scope)
-            lines.append(info.bookTitles.joined(separator: ", "))
+            // Show only the count here — listing every title balloons the footer for large
+            // corpora. The full list is a tap away (see `detailTapped`); stash the titles so
+            // that handler can present them.
+            footerBookTitles = info.bookTitles
+            lines.append("Tap to list the \(info.scopeSummary)")
             lines.append("\(p.iterations) epochs · window \(p.window) · min count \(p.minCount)")
             lines.append(String(format: "Training time: %.1fs", info.duration))
         } else {
+            footerBookTitles = []
             lines.append("Loaded from cache. Use the Nearest and Word Algebra tabs.")
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// Presents the full training-corpus book list in a scrollable sheet. No-op unless the
+    /// footer is currently showing a trained model's "N books" line (the only time
+    /// `footerBookTitles` is populated), so taps in other states do nothing.
+    @objc private func detailTapped() {
+        guard !footerBookTitles.isEmpty else { return }
+        let listVC = BookListViewController(titles: footerBookTitles)
+        let nav = UINavigationController(rootViewController: listVC)
+        if let sheet = nav.sheetPresentationController {
+            sheet.detents = [.medium(), .large()]
+            sheet.prefersGrabberVisible = true
+        }
+        present(nav, animated: true)
     }
 
     /// The idle-state hint, reflecting the currently-selected editable hyperparameters so it
@@ -755,5 +787,50 @@ private extension UIFont {
     func bold() -> UIFont {
         guard let descriptor = fontDescriptor.withSymbolicTraits(.traitBold) else { return self }
         return UIFont(descriptor: descriptor, size: pointSize)
+    }
+}
+
+// MARK: - Book list sheet
+
+/// A scrollable, modally-presented list of every book in the training corpus. Backed by a
+/// `UITableView` so it stays usable for large corpora (100+ books) where an alert would
+/// truncate or grow unwieldy. Presented from the training footer's "N books" line.
+private final class BookListViewController: UITableViewController {
+
+    private let titles: [String]
+
+    init(titles: [String]) {
+        self.titles = titles
+        super.init(style: .plain)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = titles.count == 1 ? "1 Book" : "\(titles.count) Books"
+        navigationItem.rightBarButtonItem = UIBarButtonItem(
+            systemItem: .done, primaryAction: UIAction { [weak self] _ in
+                self?.dismiss(animated: true)
+            })
+        tableView.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
+        // Titles are display-only; no selection affordance or trailing chevron.
+        tableView.allowsSelection = false
+    }
+
+    override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        titles.count
+    }
+
+    override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "cell", for: indexPath)
+        var content = cell.defaultContentConfiguration()
+        content.text = titles[indexPath.row]
+        content.textProperties.numberOfLines = 0
+        cell.contentConfiguration = content
+        return cell
     }
 }
