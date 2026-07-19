@@ -2,9 +2,9 @@
 //  GraphView.swift
 //  WordVectors
 //
-//  Feature D — A frequency-ranked scatter plot of the learned vocabulary. PCA is
-//  intentionally performed away from the main actor because projecting a large
-//  vocabulary is CPU-intensive enough to interrupt animations and slider input.
+//  Explore combines a full-vocabulary PCA scatter plot with nearest-word lookup.
+//  PCA is intentionally performed away from the main actor because projecting a
+//  large vocabulary is CPU-intensive enough to interrupt UI interactions.
 //
 
 import Charts
@@ -22,6 +22,14 @@ nonisolated private struct ProjectedWord: Identifiable, Sendable {
     var id: String { word }
 }
 
+/// A display-friendly nearest-neighbor result.
+nonisolated private struct NeighborResult: Identifiable, Sendable {
+    let word: String
+    let similarity: Float
+
+    var id: String { word }
+}
+
 /// A sendable projection job. `WordEmbeddings` is immutable after initialization, so it is
 /// safe for the detached task to read even though the package does not currently declare the
 /// reference type `Sendable`. Keeping that unchecked boundary here makes the concurrency
@@ -33,16 +41,19 @@ nonisolated private struct ProjectionRequest: @unchecked Sendable {
 
 /// Bridges `ModelStore`'s closure-based UIKit observation into SwiftUI-published state.
 ///
-/// The project defaults UI code to `MainActor`. Only the expensive PCA call crosses away from
-/// it; model changes, projection publication, and stale-result rejection all happen here.
+/// The selected word is the single source of truth for both halves of Explore. Graph taps,
+/// submitted searches, and neighbor-row taps all pass through `select(word:)`, ensuring the
+/// graph highlight, query text, message, and results cannot drift apart.
 @MainActor
 private final class GraphViewModel: ObservableObject {
     @Published private(set) var vocabularyCount = 0
-    @Published private(set) var countOptions: [Int] = []
     @Published private(set) var points: [ProjectedWord] = []
     @Published private(set) var isProjecting = false
     @Published private(set) var emptyMessage = "Train a model first (see the Train tab)."
-    @Published var sliderPosition = 0.0
+    @Published private(set) var selectedWord: String?
+    @Published private(set) var neighbors: [NeighborResult] = []
+    @Published private(set) var searchMessage = "Select a point or search the vocabulary."
+    @Published var query = "king"
 
     private var embeddings: WordEmbeddings?
     private var projectionGeneration = 0
@@ -53,16 +64,62 @@ private final class GraphViewModel: ObservableObject {
         }
     }
 
-    var selectedWordCount: Int {
-        guard !countOptions.isEmpty else { return 0 }
-        let index = min(max(Int(sliderPosition.rounded()), 0), countOptions.count - 1)
-        return countOptions[index]
+    var selectedPoint: ProjectedWord? {
+        guard let selectedWord else { return nil }
+        return points.first { $0.word == selectedWord }
     }
 
-    /// Starts work only when the user releases the slider, never for its intermediate frames.
-    func sliderEditingChanged(_ isEditing: Bool) {
-        guard !isEditing, let embeddings else { return }
-        requestProjection(embeddings: embeddings, wordCount: selectedWordCount)
+    /// Normalizes the text-field input to match the lowercased training corpus before lookup.
+    func submitSearch() {
+        let word = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !word.isEmpty else {
+            selectedWord = nil
+            neighbors = []
+            searchMessage = "Type a word to search."
+            return
+        }
+
+        query = word
+        select(word: word)
+    }
+
+    /// Selects the plotted point closest to a tap expressed in the chart's data coordinates.
+    func selectClosestPoint(x: Float, y: Float) {
+        guard let nearestPoint = points.min(by: { lhs, rhs in
+            let lhsDistance = squaredDistance(from: lhs, toX: x, y: y)
+            let rhsDistance = squaredDistance(from: rhs, toX: x, y: y)
+            return lhsDistance < rhsDistance
+        }) else { return }
+
+        select(word: nearestPoint.word)
+    }
+
+    /// Updates selection and its neighbor list together for graph, search, and list actions.
+    func select(word: String) {
+        guard let embeddings else {
+            selectedWord = nil
+            neighbors = []
+            searchMessage = "Train a model first (see the Train tab)."
+            return
+        }
+
+        guard embeddings.contains(word) else {
+            appLog.info("Explore query '\(word, privacy: .public)': out of vocabulary.")
+            selectedWord = nil
+            neighbors = []
+            searchMessage = "'\(word)' is not in the vocabulary. Try a more common word."
+            return
+        }
+
+        query = word
+        selectedWord = word
+        neighbors = embeddings.nearest(to: word, count: 10).map {
+            NeighborResult(word: $0.word, similarity: $0.similarity)
+        }
+        appLog.info("Explore query '\(word, privacy: .public)': \(self.neighbors.count, privacy: .public) results.")
+        searchMessage = neighbors.isEmpty
+            ? "No neighbours found for '\(word)'."
+            : "Nearest words to '\(word)':"
     }
 
     private func render(_ state: ModelState) {
@@ -70,16 +127,17 @@ private final class GraphViewModel: ObservableObject {
         case let .ready(embeddings):
             let vocabularyCount = embeddings.vocabulary.count
             guard vocabularyCount > 0 else {
-                clearReadyModel(message: "The trained model has no words to graph. Try training again.")
+                clearReadyModel(message: "The trained model has no words to explore. Try training again.")
                 return
             }
 
             self.embeddings = embeddings
             self.vocabularyCount = vocabularyCount
-            countOptions = Self.makeCountOptions(vocabularyCount: vocabularyCount)
-            sliderPosition = 0
             points = []
-            requestProjection(embeddings: embeddings, wordCount: countOptions[0])
+            selectedWord = nil
+            neighbors = []
+            searchMessage = "Select a point or search the vocabulary."
+            requestProjection(embeddings: embeddings, wordCount: vocabularyCount)
 
         case .idle:
             clearReadyModel(message: "Train a model first (see the Train tab).")
@@ -96,11 +154,12 @@ private final class GraphViewModel: ObservableObject {
         projectionGeneration += 1
         embeddings = nil
         vocabularyCount = 0
-        countOptions = []
-        sliderPosition = 0
         points = []
+        selectedWord = nil
+        neighbors = []
         isProjecting = false
         emptyMessage = message
+        searchMessage = message
     }
 
     private func requestProjection(embeddings: WordEmbeddings, wordCount: Int) {
@@ -116,106 +175,117 @@ private final class GraphViewModel: ObservableObject {
                 }
             }.value
 
-            // PCA itself cannot be interrupted, but changing the model or moving the slider
-            // invalidates its generation so an older completion is harmless.
+            // PCA itself cannot be interrupted, but a model-state change invalidates its
+            // generation so an older completion can never overwrite the current model.
             guard let self, generation == self.projectionGeneration else { return }
             self.points = projected
             self.isProjecting = false
         }
     }
 
-    /// Slider stops are every 1,000 words plus an exact final stop, making all words reachable
-    /// when the vocabulary size is not itself a multiple of 1,000.
-    private static func makeCountOptions(vocabularyCount: Int) -> [Int] {
-        guard vocabularyCount > 1_000 else { return [vocabularyCount] }
-
-        var options = Array(stride(from: 1_000, through: vocabularyCount, by: 1_000))
-        if options.last != vocabularyCount {
-            options.append(vocabularyCount)
-        }
-        return options
+    private func squaredDistance(from point: ProjectedWord, toX x: Float, y: Float) -> Float {
+        let deltaX = point.x - x
+        let deltaY = point.y - y
+        return deltaX * deltaX + deltaY * deltaY
     }
 }
 
-/// Swift Charts presentation of the model's two-dimensional PCA projection.
+/// SwiftUI presentation of full-vocabulary projection and nearest-neighbor exploration.
 struct GraphView: View {
     @StateObject private var viewModel = GraphViewModel()
-
-    private static let wordCountFormatter: NumberFormatter = {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        formatter.usesGroupingSeparator = true
-        return formatter
-    }()
 
     var body: some View {
         Group {
             if viewModel.vocabularyCount == 0 {
                 ContentUnavailableView(
-                    "No Model to Graph",
+                    "No Model to Explore",
                     systemImage: "chart.dots.scatter",
                     description: Text(viewModel.emptyMessage)
                 )
             } else {
-                graphContent
+                exploreContent
             }
         }
         .background(Color(uiColor: .systemBackground))
     }
 
-    private var graphContent: some View {
+    private var exploreContent: some View {
         VStack(spacing: 12) {
-            HStack(spacing: 10) {
-                Text("\(formattedWordCount) words")
-                    .font(.headline)
-                    .contentTransition(.numericText())
-
-                Spacer()
-
-                if viewModel.isProjecting {
-                    ProgressView()
-                        .controlSize(.small)
-                        .accessibilityLabel("Projecting word vectors")
-                }
-            }
+            chartHeader
 
             ZStack {
                 scatterChart
 
                 if viewModel.points.isEmpty, viewModel.isProjecting {
-                    ProgressView("Projecting vectors…")
+                    ProgressView("Projecting all vectors…")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .padding()
                         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(maxWidth: .infinity)
+            .frame(height: 280)
 
-            if viewModel.vocabularyCount > 1_000 {
-                Slider(
-                    value: $viewModel.sliderPosition,
-                    in: 0...Double(viewModel.countOptions.count - 1),
-                    step: 1,
-                    onEditingChanged: viewModel.sliderEditingChanged
-                )
-                .accessibilityLabel("Number of words")
-                .accessibilityValue("\(viewModel.selectedWordCount) words")
-            }
+            Divider()
+
+            searchField
+
+            Text(viewModel.searchMessage)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            neighborList
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.top, 12)
+    }
+
+    private var chartHeader: some View {
+        HStack(spacing: 10) {
+            Text("\(viewModel.vocabularyCount.formatted()) words")
+                .font(.headline)
+                .contentTransition(.numericText())
+
+            Spacer()
+
+            if viewModel.isProjecting {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Projecting word vectors")
+            }
+        }
     }
 
     private var scatterChart: some View {
-        Chart(viewModel.points) { point in
-            PointMark(
-                x: .value("PCA dimension 1", point.x),
-                y: .value("PCA dimension 2", point.y)
-            )
-            .foregroundStyle(by: .value("Frequency rank", point.rank))
-            .symbolSize(18)
-            .opacity(0.7)
+        Chart {
+            ForEach(viewModel.points) { point in
+                PointMark(
+                    x: .value("PCA dimension 1", point.x),
+                    y: .value("PCA dimension 2", point.y)
+                )
+                .foregroundStyle(by: .value("Frequency rank", point.rank))
+                .symbolSize(18)
+                .opacity(0.7)
+            }
+
+            if let selectedPoint = viewModel.selectedPoint {
+                PointMark(
+                    x: .value("Selected PCA dimension 1", selectedPoint.x),
+                    y: .value("Selected PCA dimension 2", selectedPoint.y)
+                )
+                .foregroundStyle(Color.accentColor)
+                .symbolSize(100)
+                .annotation(position: .top, spacing: 6) {
+                    Text(selectedPoint.word)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 4)
+                        .background(.regularMaterial, in: Capsule())
+                }
+            }
         }
         .chartForegroundStyleScale(
             range: Gradient(colors: [
@@ -249,12 +319,75 @@ struct GraphView: View {
                 .background(Color.secondary.opacity(0.045))
                 .clipShape(RoundedRectangle(cornerRadius: 10))
         }
+        .chartOverlay { proxy in
+            GeometryReader { geometry in
+                Rectangle()
+                    .fill(.clear)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        SpatialTapGesture()
+                            .onEnded { value in
+                                guard let plotFrame = proxy.plotFrame else { return }
+                                let frame = geometry[plotFrame]
+                                guard frame.contains(value.location) else { return }
+                                let plotLocation = CGPoint(
+                                    x: value.location.x - frame.minX,
+                                    y: value.location.y - frame.minY
+                                )
+                                guard let x = proxy.value(atX: plotLocation.x, as: Float.self),
+                                      let y = proxy.value(atY: plotLocation.y, as: Float.self)
+                                else { return }
+                                viewModel.selectClosestPoint(x: x, y: y)
+                            }
+                    )
+            }
+        }
         .accessibilityLabel("Word vector scatter plot")
         .accessibilityValue("\(viewModel.points.count) projected words")
     }
 
-    private var formattedWordCount: String {
-        Self.wordCountFormatter.string(from: NSNumber(value: viewModel.selectedWordCount))
-            ?? String(viewModel.selectedWordCount)
+    private var searchField: some View {
+        HStack(spacing: 10) {
+            TextField("Search vocabulary", text: $viewModel.query)
+                .textFieldStyle(.roundedBorder)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .submitLabel(.search)
+                .onSubmit(viewModel.submitSearch)
+
+            Button(action: viewModel.submitSearch) {
+                Label("Search", systemImage: "magnifyingglass")
+            }
+            .buttonStyle(.borderedProminent)
+        }
+    }
+
+    private var neighborList: some View {
+        List {
+            ForEach(Array(viewModel.neighbors.enumerated()), id: \.element.id) { index, neighbor in
+                Button {
+                    viewModel.select(word: neighbor.word)
+                } label: {
+                    HStack(spacing: 12) {
+                        Text("\(index + 1).")
+                            .foregroundStyle(.secondary)
+                            .frame(width: 24, alignment: .trailing)
+
+                        Text(neighbor.word)
+                            .foregroundStyle(.primary)
+
+                        Spacer()
+
+                        Text(neighbor.similarity.formatted(.number.precision(.fractionLength(3))))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
     }
 }
