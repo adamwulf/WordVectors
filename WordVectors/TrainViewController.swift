@@ -157,7 +157,7 @@ final class TrainViewController: UIViewController {
             ParameterStepperRow(
                 title: "Vector length",
                 subtitle: "dimensions per word",
-                range: 25...300, step: 25, value: parameters.vectorSize
+                range: 25...1000, step: 25, value: parameters.vectorSize
             ) { [weak self] in self?.parameters.vectorSize = $0; self?.parametersChanged() },
             ParameterStepperRow(
                 title: "Iterations",
