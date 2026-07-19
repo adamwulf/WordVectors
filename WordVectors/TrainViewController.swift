@@ -24,6 +24,10 @@ final class TrainViewController: UIViewController {
     /// One checkbox row per book, kept so we can refresh their checked state on toggle.
     private var bookRows: [BookRow] = []
 
+    /// The "Select All" header row above the book list, kept so its checked state can be
+    /// refreshed whenever the selection changes. `nil` when no books are bundled.
+    private var selectAllRow: SelectAllRow?
+
     /// The hyperparameters training will use. Seeded from `Word2VecParameters` defaults; the
     /// four Tier-1 stepper rows write their edited values back into this struct, and every
     /// other (Tier-2/3) field is shown read-only and left at its default.
@@ -117,6 +121,15 @@ final class TrainViewController: UIViewController {
             return row
         }
 
+        // "Select All" header row above the book list, only when there's a list to select.
+        // Toggling it on selects every book; off collapses to just the first book (which keeps
+        // the "at least one book always selected" invariant). Only created when books exist.
+        if !books.isEmpty {
+            let row = SelectAllRow()
+            row.onToggle = { [weak self] in self?.toggleSelectAll() }
+            selectAllRow = row
+        }
+
         let booksStack = UIStackView(arrangedSubviews: bookRows)
         booksStack.axis = .vertical
         booksStack.spacing = 4
@@ -205,14 +218,24 @@ final class TrainViewController: UIViewController {
             booksStack.widthAnchor.constraint(equalTo: booksFrame.widthAnchor),
         ])
 
-        let corpusColumn = UIStackView(arrangedSubviews: [
-            corpusHeader,
-            booksScrollView,
-            selectionHintLabel,
-        ])
+        // The "Select All" row sits between the header and the scrolling book list, so it stays
+        // pinned at the top while the list scrolls beneath it. Only present when books exist.
+        var corpusColumnViews: [UIView] = [corpusHeader]
+        if let selectAllRow {
+            corpusColumnViews.append(selectAllRow)
+        }
+        corpusColumnViews.append(booksScrollView)
+        corpusColumnViews.append(selectionHintLabel)
+
+        let corpusColumn = UIStackView(arrangedSubviews: corpusColumnViews)
         corpusColumn.axis = .vertical
         corpusColumn.spacing = 16
         corpusColumn.alignment = .fill
+        // Tighten the gap between the "Select All" row and the list it controls so they read as
+        // one unit, distinct from the header above.
+        if let selectAllRow {
+            corpusColumn.setCustomSpacing(8, after: selectAllRow)
+        }
 
         let paramsColumn = UIStackView(arrangedSubviews: [
             paramsCaption,
@@ -288,10 +311,29 @@ final class TrainViewController: UIViewController {
         updateSelectionState()
     }
 
+    /// Handles the "Select All" header row. When every book is already selected, toggling it off
+    /// collapses the selection to just the first book — never to nothing, preserving the
+    /// "at least one book always selected" invariant. Otherwise it selects every book.
+    private func toggleSelectAll() {
+        if selectedStems.count == books.count {
+            // All selected → collapse to just the first book on screen.
+            if let first = books.first {
+                selectedStems = [first.stem]
+            }
+        } else {
+            // Some or none selected → select everything.
+            selectedStems = Set(books.map { $0.stem })
+        }
+        refreshBookRows()
+        updateSelectionState()
+    }
+
     private func refreshBookRows() {
         for row in bookRows {
             row.setChecked(selectedStems.contains(row.book.stem))
         }
+        // The header reflects reality: checked only when every book is selected.
+        selectAllRow?.setChecked(!books.isEmpty && selectedStems.count == books.count)
     }
 
     /// Enables/disables Train based on whether anything is selected and updates the hint.
@@ -426,6 +468,7 @@ final class TrainViewController: UIViewController {
     /// When `idle` is false the user is mid-run: disable inputs to prevent overlap.
     /// When idle, Train also requires at least one selected book.
     private func setControlsEnabled(idle: Bool) {
+        selectAllRow?.isEnabled = idle
         for row in bookRows { row.isEnabled = idle }
         for row in paramRows { row.isEnabled = idle }
         trainButton.isEnabled = idle && !selectedStems.isEmpty
@@ -490,6 +533,89 @@ private final class BookRow: UIControl {
         titleLabel.textColor = isEnabled ? .label : .secondaryLabel
         accessibilityLabel = book.title
         accessibilityValue = checked ? "Selected" : "Not selected"
+    }
+
+    override var isEnabled: Bool {
+        didSet {
+            alpha = isEnabled ? 1.0 : 0.5
+            titleLabel.textColor = isEnabled ? .label : .secondaryLabel
+        }
+    }
+
+    @objc private func tapped() {
+        onToggle?()
+    }
+}
+
+// MARK: - Select-all header row
+
+/// A tappable "Select All" row that sits above the book list. Behaves like the book checkboxes —
+/// the whole row is one touch target reporting toggles via `onToggle` — but is styled as a header:
+/// its label is emphasized and a hairline separator sits beneath it to set it off from the list.
+/// It shows checked only when every book is selected; the controller drives its state.
+private final class SelectAllRow: UIControl {
+
+    var onToggle: (() -> Void)?
+
+    private let checkImageView = UIImageView()
+    private let titleLabel = UILabel()
+    private var checked = false
+
+    init() {
+        super.init(frame: .zero)
+        buildUI()
+        addTarget(self, action: #selector(tapped), for: .touchUpInside)
+        accessibilityTraits = .button
+        isAccessibilityElement = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private func buildUI() {
+        checkImageView.contentMode = .scaleAspectFit
+        checkImageView.setContentHuggingPriority(.required, for: .horizontal)
+        checkImageView.tintColor = .tintColor
+
+        titleLabel.text = "Select All"
+        titleLabel.font = .preferredFont(forTextStyle: .subheadline).bold()
+        titleLabel.numberOfLines = 0
+
+        let row = UIStackView(arrangedSubviews: [checkImageView, titleLabel])
+        row.axis = .horizontal
+        row.spacing = 12
+        row.alignment = .center
+        row.isUserInteractionEnabled = false // let the control receive the touch
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+
+        // A hairline separator beneath the row visually groups it with the list it controls
+        // while still setting it apart as a header.
+        let separator = UIView()
+        separator.backgroundColor = .separator
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(separator)
+
+        NSLayoutConstraint.activate([
+            checkImageView.widthAnchor.constraint(equalToConstant: 26),
+            checkImageView.heightAnchor.constraint(equalToConstant: 26),
+            row.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor),
+            separator.topAnchor.constraint(equalTo: row.bottomAnchor, constant: 8),
+            separator.leadingAnchor.constraint(equalTo: leadingAnchor),
+            separator.trailingAnchor.constraint(equalTo: trailingAnchor),
+            separator.bottomAnchor.constraint(equalTo: bottomAnchor),
+            separator.heightAnchor.constraint(equalToConstant: 1.0 / UIScreen.main.scale),
+        ])
+    }
+
+    func setChecked(_ checked: Bool) {
+        self.checked = checked
+        let name = checked ? "checkmark.square.fill" : "square"
+        checkImageView.image = UIImage(systemName: name)
+        accessibilityLabel = "Select All"
+        accessibilityValue = checked ? "All books selected" : "Not all books selected"
     }
 
     override var isEnabled: Bool {
@@ -620,6 +746,14 @@ private extension UIFont {
                 UIFontDescriptor.FeatureKey.selector: kMonospacedNumbersSelector,
             ]],
         ])
+        return UIFont(descriptor: descriptor, size: pointSize)
+    }
+
+    /// A bold variant of the same size/style, used to emphasize the "Select All" header while
+    /// keeping it a Dynamic Type text style. Falls back to the original font if the bold trait
+    /// can't be applied.
+    func bold() -> UIFont {
+        guard let descriptor = fontDescriptor.withSymbolicTraits(.traitBold) else { return self }
         return UIFont(descriptor: descriptor, size: pointSize)
     }
 }
