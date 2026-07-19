@@ -90,15 +90,14 @@ private final class GraphViewModel: ObservableObject {
         select(word: word)
     }
 
-    /// Selects the plotted point closest to a tap expressed in the chart's data coordinates.
-    func selectClosestPoint(x: Float, y: Float) {
-        guard let nearestPoint = points.min(by: { lhs, rhs in
-            let lhsDistance = squaredDistance(from: lhs, toX: x, y: y)
-            let rhsDistance = squaredDistance(from: rhs, toX: x, y: y)
-            return lhsDistance < rhsDistance
-        }) else { return }
-
-        select(word: nearestPoint.word)
+    /// Clears the current selection when the user taps empty space in the graph. The query text
+    /// is left as-is so a mistaken tap doesn't wipe out what they typed, but the highlighted
+    /// point, neighbor list, and message all reset to the neutral prompt.
+    func deselect() {
+        guard selectedWord != nil else { return }
+        selectedWord = nil
+        neighbors = []
+        searchMessage = "Select a point or search the vocabulary."
     }
 
     /// Updates selection and its neighbor list together for graph, search, and list actions.
@@ -194,12 +193,6 @@ private final class GraphViewModel: ObservableObject {
             self.isProjecting = false
         }
     }
-
-    private func squaredDistance(from point: ProjectedWord, toX x: Float, y: Float) -> Float {
-        let deltaX = point.x - x
-        let deltaY = point.y - y
-        return deltaX * deltaX + deltaY * deltaY
-    }
 }
 
 /// SwiftUI presentation of full-vocabulary projection and nearest-neighbor exploration.
@@ -288,14 +281,18 @@ struct GraphView: View {
                     y: .value("Selected PCA dimension 2", selectedPoint.y)
                 )
                 .foregroundStyle(Color.accentColor)
-                .symbolSize(100)
+                .symbolSize(120)
                 .annotation(position: .top, spacing: 6) {
+                    // The label's colors are set explicitly rather than inherited: the mark's
+                    // accentColor foregroundStyle otherwise cascades into the annotation and
+                    // renders the word as an unreadable dark blob. A solid accent capsule with a
+                    // white-on-accent label stays legible in both light and dark mode.
                     Text(selectedPoint.word)
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(.primary)
-                        .padding(.horizontal, 7)
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 8)
                         .padding(.vertical, 4)
-                        .background(.regularMaterial, in: Capsule())
+                        .background(Color.accentColor, in: Capsule())
                 }
             }
         }
@@ -339,23 +336,63 @@ struct GraphView: View {
                     .gesture(
                         SpatialTapGesture()
                             .onEnded { value in
-                                guard let plotFrame = proxy.plotFrame else { return }
-                                let frame = geometry[plotFrame]
-                                guard frame.contains(value.location) else { return }
-                                let plotLocation = CGPoint(
-                                    x: value.location.x - frame.minX,
-                                    y: value.location.y - frame.minY
-                                )
-                                guard let x = proxy.value(atX: plotLocation.x, as: Float.self),
-                                      let y = proxy.value(atY: plotLocation.y, as: Float.self)
-                                else { return }
-                                viewModel.selectClosestPoint(x: x, y: y)
+                                handleTap(at: value.location, proxy: proxy, geometry: geometry)
                             }
                     )
             }
         }
         .accessibilityLabel("Word vector scatter plot")
         .accessibilityValue("\(viewModel.points.count) projected words")
+    }
+
+    /// A tap must land within this many points of a plotted marker to select it. Tapping the
+    /// empty space beyond that radius deselects instead, so the graph reads as "nothing here"
+    /// rather than snapping to some far-off point the user never aimed at. Sized for a fingertip,
+    /// not the ~5pt marker: at a tighter radius a tap that visibly lands on the point cloud can
+    /// still miss the nearest actual dot by 20–30pt, so it must be forgiving enough to feel like
+    /// "tap near a word" while the wide empty bands above/below the streak still read as deselect.
+    private static let selectionHitRadius: CGFloat = 28
+
+    /// Resolves a tap in the chart overlay to either the nearest nearby word or a deselection.
+    ///
+    /// The hit-test is done in SCREEN space, not data space: the x and y axes span very
+    /// different data ranges (PC1 ≈ ±1, PC2 ≈ ±0.05), so a fixed data-space radius would be an
+    /// ellipse on screen. Projecting each point back to plot pixels via the chart proxy makes
+    /// the radius a true circle in points, matching what the user sees under their finger.
+    private func handleTap(at location: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) {
+        guard let plotFrame = proxy.plotFrame else { return }
+        let frame = geometry[plotFrame]
+        guard frame.contains(location) else { return }
+
+        // `proxy.position(forX:)` returns coordinates relative to the plot area's origin, so
+        // convert the tap (which arrives in the overlay's space) to the same plot-relative
+        // space by subtracting the plot origin. Comparing both in one space is what keeps the
+        // hit-test honest — an earlier version offset only one side and every point read ~16pt
+        // off, so taps on the visible streak found nothing within the radius.
+        let tap = CGPoint(x: location.x - frame.minX, y: location.y - frame.minY)
+
+        // Find the plotted point whose on-screen position is closest to the tap.
+        var nearestWord: String?
+        var nearestDistanceSquared = CGFloat.greatestFiniteMagnitude
+        for point in viewModel.points {
+            guard let px = proxy.position(forX: point.x),
+                  let py = proxy.position(forY: point.y) else { continue }
+            let dx = px - tap.x
+            let dy = py - tap.y
+            let distanceSquared = dx * dx + dy * dy
+            if distanceSquared < nearestDistanceSquared {
+                nearestDistanceSquared = distanceSquared
+                nearestWord = point.word
+            }
+        }
+
+        // Within the hit radius, select that word; otherwise the tap was on empty space.
+        let radius = Self.selectionHitRadius
+        if let nearestWord, nearestDistanceSquared <= radius * radius {
+            viewModel.select(word: nearestWord)
+        } else {
+            viewModel.deselect()
+        }
     }
 
     private var searchField: some View {
