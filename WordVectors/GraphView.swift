@@ -9,6 +9,7 @@
 
 import Charts
 import Combine
+import os
 import SwiftUI
 import WordVectorKit
 
@@ -57,6 +58,12 @@ private final class GraphViewModel: ObservableObject {
 
     private var embeddings: WordEmbeddings?
     private var projectionGeneration = 0
+
+    /// The in-flight projection task, retained so a newer request can cancel a superseded one
+    /// before it starts its (uninterruptible) SVD, rather than letting several large PCA runs
+    /// stack up on the background cores. The generation guard still protects correctness; this
+    /// only reclaims wasted CPU when projections are requested in quick succession.
+    private var projectionTask: Task<Void, Never>?
 
     init() {
         ModelStore.shared.addObserver(self) { [weak self] state in
@@ -168,9 +175,14 @@ private final class GraphViewModel: ObservableObject {
         let request = ProjectionRequest(embeddings: embeddings, wordCount: wordCount)
         isProjecting = true
 
-        Task { [weak self] in
-            let projected = await Task.detached(priority: .userInitiated) {
-                request.embeddings.projected2D(wordCount: request.wordCount).enumerated().map { rank, point in
+        // Supersede any still-pending projection so back-to-back requests don't stack SVDs.
+        projectionTask?.cancel()
+        projectionTask = Task { [weak self] in
+            let projected = await Task.detached(priority: .userInitiated) { () -> [ProjectedWord] in
+                // If this request was superseded before the detached work started, skip the
+                // uninterruptible SVD entirely — its result would be dropped by the guard below.
+                if Task.isCancelled { return [] }
+                return request.embeddings.projected2D(wordCount: request.wordCount).enumerated().map { rank, point in
                     ProjectedWord(word: point.word, x: point.x, y: point.y, rank: rank)
                 }
             }.value
