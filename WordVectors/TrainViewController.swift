@@ -477,17 +477,13 @@ final class TrainViewController: UIViewController {
         return lines.joined(separator: "\n")
     }
 
-    /// Presents the full training-corpus book list in a scrollable sheet. No-op unless the
+    /// Presents the full training-corpus book list as a standard modal dialog. No-op unless the
     /// footer is currently showing a trained model's "N books" line (the only time
     /// `footerBookTitles` is populated), so taps in other states do nothing.
     @objc private func detailTapped() {
         guard !footerBookTitles.isEmpty else { return }
         let listVC = BookListViewController(titles: footerBookTitles)
         let nav = UINavigationController(rootViewController: listVC)
-        if let sheet = nav.sheetPresentationController {
-            sheet.detents = [.medium(), .large()]
-            sheet.prefersGrabberVisible = true
-        }
         present(nav, animated: true)
     }
 
