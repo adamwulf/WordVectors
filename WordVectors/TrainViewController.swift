@@ -167,14 +167,35 @@ final class TrainViewController: UIViewController {
         advancedLabel.numberOfLines = 0
         advancedLabel.text = readOnlyParametersText()
 
-        let stack = UIStackView(arrangedSubviews: [
-            statusLabel,
+        // The book list and the hyperparameters sit side by side: books in the leading column,
+        // hyperparameters in the trailing column, each with its own caption.
+        let corpusColumn = UIStackView(arrangedSubviews: [
             corpusCaption,
             booksStack,
             selectionHintLabel,
+        ])
+        corpusColumn.axis = .vertical
+        corpusColumn.spacing = 16
+        corpusColumn.alignment = .fill
+
+        let paramsColumn = UIStackView(arrangedSubviews: [
             paramsCaption,
             paramsStack,
             advancedLabel,
+        ])
+        paramsColumn.axis = .vertical
+        paramsColumn.spacing = 16
+        paramsColumn.alignment = .fill
+
+        let columns = UIStackView(arrangedSubviews: [corpusColumn, paramsColumn])
+        columns.axis = .horizontal
+        columns.spacing = 24
+        columns.alignment = .top
+        columns.distribution = .fillEqually
+
+        let stack = UIStackView(arrangedSubviews: [
+            statusLabel,
+            columns,
             trainButton,
             progressView,
             progressLabel,
@@ -490,13 +511,13 @@ private final class ParameterStepperRow: UIView {
         // the value + stepper should sit just to the right of the title, not across the row.
         labels.setContentHuggingPriority(.required, for: .horizontal)
 
-        // A flexible spacer that absorbs the row's extra width, keeping the labels, value, and
-        // stepper grouped together on the leading side instead of spread across the whole row.
+        // A flexible spacer that absorbs the row's extra width, pushing the value and stepper to
+        // the trailing edge so they line up across every row regardless of label width.
         let spacer = UIView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let row = UIStackView(arrangedSubviews: [labels, valueLabel, stepper, spacer])
+        let row = UIStackView(arrangedSubviews: [labels, spacer, valueLabel, stepper])
         row.axis = .horizontal
         row.spacing = 12
         row.alignment = .center
