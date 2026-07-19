@@ -90,6 +90,13 @@ final class TrainViewController: UIViewController {
         retrainButton.configuration = retrainConfig
         retrainButton.addTarget(self, action: #selector(retrainTapped), for: .touchUpInside)
 
+        // Title + subtitle for the leading column, mirroring the "Hyperparameters" headline in
+        // the trailing column so both columns read the same way.
+        let corpusTitle = UILabel()
+        corpusTitle.text = "Training Corpus"
+        corpusTitle.font = .preferredFont(forTextStyle: .headline)
+        corpusTitle.textAlignment = .center
+
         let corpusCaption = UILabel()
         corpusCaption.text = "Choose books to train on (more books = slower, better vectors)"
         corpusCaption.font = .preferredFont(forTextStyle: .footnote)
@@ -169,8 +176,15 @@ final class TrainViewController: UIViewController {
 
         // The book list and the hyperparameters sit side by side: books in the leading column,
         // hyperparameters in the trailing column, each with its own caption.
+        // Title sits directly above its subtitle with tight spacing, so the pair reads as one
+        // header while still lining up with the trailing column's "Hyperparameters" headline.
+        let corpusHeader = UIStackView(arrangedSubviews: [corpusTitle, corpusCaption])
+        corpusHeader.axis = .vertical
+        corpusHeader.spacing = 4
+        corpusHeader.alignment = .fill
+
         let corpusColumn = UIStackView(arrangedSubviews: [
-            corpusCaption,
+            corpusHeader,
             booksStack,
             selectionHintLabel,
         ])
@@ -332,7 +346,14 @@ final class TrainViewController: UIViewController {
     }
 
     private func readyDetail(model: WordEmbeddings) -> String {
-        var lines = ["Vocabulary: \(model.vocabulary.count) words · \(model.vectorSize) dims"]
+        var firstLine = "Vocabulary: \(model.vocabulary.count) words · \(model.vectorSize) dims"
+        // Append the model's on-disk size when it's cached, so the footer reports how large the
+        // final saved model actually is.
+        if let bytes = ModelStore.shared.cachedModelByteSize {
+            let size = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+            firstLine += " · \(size) on disk"
+        }
+        var lines = [firstLine]
         if let info = ModelStore.shared.lastTrainingInfo {
             let p = info.parameters
             // Note provenance so cached detail isn't mistaken for a run that just happened.
