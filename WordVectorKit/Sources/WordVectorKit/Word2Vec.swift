@@ -33,15 +33,14 @@ private final class TrainingProgressCounter {
 
     func add(_ count: Int, startingAlpha: Double, denominator: Int,
              totalTrainWords: Int, progress: ((Double) -> Void)?) -> Double {
-        guard count > 0 else { return startingAlpha }
-
         lock.lock()
-        defer { lock.unlock() }
-
         wordCountActual += count
         var alpha = startingAlpha * (1 - Double(wordCountActual) / Double(denominator))
         if alpha < startingAlpha * 0.0001 { alpha = startingAlpha * 0.0001 }
-        progress?(min(1.0, Double(wordCountActual) / Double(totalTrainWords)))
+        let fraction = min(1.0, Double(wordCountActual) / Double(totalTrainWords))
+        lock.unlock()
+
+        progress?(fraction)
         return alpha
     }
 }
@@ -281,13 +280,16 @@ public final class Word2Vec {
 
                         // Flush this worker's remaining count before its next local epoch.
                         // ref: word2vec.c lines 421-428
-                        alpha = progressCounter.add(
-                            wordCount - lastWordCount,
-                            startingAlpha: startingAlpha,
-                            denominator: iterCount * trainWords + 1,
-                            totalTrainWords: totalTrainWords,
-                            progress: progress
-                        )
+                        let remainder = wordCount - lastWordCount
+                        if remainder > 0 {
+                            alpha = progressCounter.add(
+                                remainder,
+                                startingAlpha: startingAlpha,
+                                denominator: iterCount * trainWords + 1,
+                                totalTrainWords: totalTrainWords,
+                                progress: progress
+                            )
+                        }
                         wordCount = 0
                         lastWordCount = 0
                     }
