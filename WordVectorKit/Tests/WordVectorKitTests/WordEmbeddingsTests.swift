@@ -86,6 +86,80 @@ final class WordEmbeddingsTests: XCTestCase {
         XCTAssertEqual(neighbors[0].similarity, 1 / 2.0.squareRoot().magnitude.float, accuracy: 1e-5)
     }
 
+    // MARK: - Distance metrics
+
+    func testDotProductRewardsMagnitude() {
+        // All three candidates point the same direction as the query, so cosine ties them,
+        // but dot product should rank the largest-magnitude vector first.
+        let emb = WordEmbeddings(dictionary: [
+            "q":     [1, 0],
+            "small": [1, 0],
+            "mid":   [3, 0],
+            "big":   [9, 0]
+        ])
+        let neighbors = emb.nearest(to: "q", count: 3, metric: .dotProduct)
+        XCTAssertEqual(neighbors.map { $0.word }, ["big", "mid", "small"])
+        // Dot product with q = [1,0] is just the candidate's x component.
+        XCTAssertEqual(neighbors[0].score, 9, accuracy: 1e-5)
+        XCTAssertEqual(neighbors[2].score, 1, accuracy: 1e-5)
+    }
+
+    func testEuclideanOrdersByAscendingDistanceBestFirst() {
+        // Distances from q=[0,0]: near=1, mid=2, far=5. Best (smallest) must come first.
+        let emb = WordEmbeddings(dictionary: [
+            "q":    [0, 0],
+            "near": [1, 0],
+            "mid":  [0, 2],
+            "far":  [3, 4]   // distance 5
+        ])
+        let neighbors = emb.nearest(to: "q", count: 3, metric: .euclidean)
+        XCTAssertEqual(neighbors.map { $0.word }, ["near", "mid", "far"])
+        XCTAssertEqual(neighbors[0].score, 1, accuracy: 1e-5)
+        XCTAssertEqual(neighbors[1].score, 2, accuracy: 1e-5)
+        XCTAssertEqual(neighbors[2].score, 5, accuracy: 1e-5)
+    }
+
+    func testCosineMetricMatchesLegacyNearest() {
+        // The metric-aware cosine path must agree with the original similarity-based API.
+        let emb = WordEmbeddings(dictionary: [
+            "a": [1, 0],
+            "b": [1, 0.1],
+            "c": [0, 1],
+            "d": [-1, 0]
+        ])
+        let legacy = emb.nearest(to: "a", count: 3)
+        let metric = emb.nearest(to: "a", count: 3, metric: .cosine)
+        XCTAssertEqual(legacy.map { $0.word }, metric.map { $0.word })
+        for (l, m) in zip(legacy, metric) {
+            XCTAssertEqual(l.similarity, m.score, accuracy: 1e-6)
+        }
+    }
+
+    func testAnalogyWithMetricExcludesInputs() {
+        // Same grid as the cosine analogy test, but scored by Euclidean distance: the exact
+        // match still wins (distance 0) and the three inputs are still excluded.
+        let emb = WordEmbeddings(dictionary: [
+            "man":   [1, 0],
+            "woman": [1, 1],
+            "king":  [5, 0],
+            "queen": [5, 1],
+            "noise": [-3, -3]
+        ])
+        let result = emb.analogy(base: "king", minus: "man", plus: "woman", count: 3, metric: .euclidean)
+        XCTAssertFalse(result.contains { ["king", "man", "woman"].contains($0.word) })
+        XCTAssertEqual(result.first?.word, "queen")
+        XCTAssertEqual(result.first?.score ?? -1, 0, accuracy: 1e-5)
+    }
+
+    func testMetricDisplayMetadata() {
+        XCTAssertEqual(DistanceMetric.allCases, [.cosine, .dotProduct, .euclidean])
+        XCTAssertTrue(DistanceMetric.cosine.isHigherBetter)
+        XCTAssertTrue(DistanceMetric.dotProduct.isHigherBetter)
+        XCTAssertFalse(DistanceMetric.euclidean.isHigherBetter)
+        XCTAssertEqual(DistanceMetric.cosine.scoreColumnTitle, "Score")
+        XCTAssertEqual(DistanceMetric.euclidean.scoreColumnTitle, "Distance")
+    }
+
     // MARK: - Analogy (word algebra)
 
     func testAnalogyReturnsUnambiguousAnswer() {

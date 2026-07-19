@@ -117,6 +117,14 @@ final class ModelStore {
         cacheURL.deletingPathExtension().appendingPathExtension("json")
     }
 
+    /// On-disk size, in bytes, of the cached model file — the size of the final saved model.
+    /// `nil` when nothing is cached (e.g. the model didn't persist, or was cleared). Reflects
+    /// the actual file the app wrote, not a re-computed estimate, so it matches what's on disk.
+    var cachedModelByteSize: Int? {
+        guard let values = try? cacheURL.resourceValues(forKeys: [.fileSizeKey]) else { return nil }
+        return values.fileSize
+    }
+
     // MARK: - Lifecycle
 
     private init() {}
@@ -229,8 +237,9 @@ final class ModelStore {
                 case let .success(model, info):
                     ModelStore.shared.lastTrainingInfo = info
                     ModelStore.shared.trainingInfoFromCache = false
-                    ModelStore.shared.state = .ready(model)
                     // Cache for instant subsequent launches (best-effort; failure is non-fatal).
+                    // The model is persisted BEFORE state becomes `.ready` so the first render
+                    // can report the model's on-disk size; a save failure just omits that detail.
                     do {
                         try model.save(to: cacheURL)
                         appLog.info("Cached trained model to disk.")
@@ -249,6 +258,9 @@ final class ModelStore {
                         // doesn't pair fresh metadata with an old cached model.
                         try? FileManager.default.removeItem(at: metadataURL)
                     }
+                    // Publish the ready model only after the save attempt, so `readyDetail`'s
+                    // on-disk size reflects the file just written (or is correctly absent).
+                    ModelStore.shared.state = .ready(model)
                 case let .failure(message):
                     appLog.error("Training failed: \(message, privacy: .public)")
                     ModelStore.shared.state = .failed(message)

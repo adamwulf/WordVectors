@@ -23,10 +23,11 @@ nonisolated private struct ProjectedWord: Identifiable, Sendable {
     var id: String { word }
 }
 
-/// A display-friendly nearest-neighbor result.
+/// A display-friendly nearest-neighbor result. `score` is the selected metric's natural value
+/// (similarity for cosine/dot, distance for Euclidean).
 nonisolated private struct NeighborResult: Identifiable, Sendable {
     let word: String
-    let similarity: Float
+    let score: Float
 
     var id: String { word }
 }
@@ -55,6 +56,15 @@ private final class GraphViewModel: ObservableObject {
     @Published private(set) var neighbors: [NeighborResult] = []
     @Published private(set) var searchMessage = "Select a point or search the vocabulary."
     @Published var query = "king"
+
+    /// The distance metric used to rank neighbors. Changing it re-ranks the current selection so
+    /// the list and its score column immediately reflect the new metric.
+    @Published var metric: DistanceMetric = .cosine {
+        didSet {
+            guard metric != oldValue else { return }
+            rerankCurrentSelection()
+        }
+    }
 
     private var embeddings: WordEmbeddings?
     private var projectionGeneration = 0
@@ -119,13 +129,20 @@ private final class GraphViewModel: ObservableObject {
 
         query = word
         selectedWord = word
-        neighbors = embeddings.nearest(to: word, count: 10).map {
-            NeighborResult(word: $0.word, similarity: $0.similarity)
+        neighbors = embeddings.nearest(to: word, count: 10, metric: metric).map {
+            NeighborResult(word: $0.word, score: $0.score)
         }
-        appLog.info("Explore query '\(word, privacy: .public)': \(self.neighbors.count, privacy: .public) results.")
+        appLog.info("Explore query '\(word, privacy: .public)' [\(self.metric.rawValue, privacy: .public)]: \(self.neighbors.count, privacy: .public) results.")
         searchMessage = neighbors.isEmpty
             ? "No neighbours found for '\(word)'."
             : "Nearest words to '\(word)':"
+    }
+
+    /// Re-ranks the current selection under the newly-chosen metric without changing what's
+    /// selected. A no-op when nothing is selected (there are no neighbors to re-rank).
+    private func rerankCurrentSelection() {
+        guard let selectedWord else { return }
+        select(word: selectedWord)
     }
 
     private func render(_ state: ModelState) {
@@ -229,22 +246,39 @@ struct GraphView: View {
                         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
                 }
             }
+            // The plot takes a little over half of the tab's height (with a comfortable floor so
+            // it stays readable on short windows), leaving the rest for the neighbor list below.
             .frame(maxWidth: .infinity)
-            .frame(height: 280)
+            .containerRelativeFrame(.vertical) { height, _ in max(360, height * 0.55) }
 
             Divider()
 
             searchField
 
-            Text(viewModel.searchMessage)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            metricPicker
 
+            HStack {
+                Text(viewModel.searchMessage)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                // Header for the score column, adapting to the metric ("Score" vs "Distance").
+                Text(viewModel.metric.scoreColumnTitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            // The neighbor list fills whatever height remains and scrolls when the results
+            // don't fit, rather than being clipped or pushing the plot off-screen.
             neighborList
+                .frame(maxHeight: .infinity)
         }
         .padding(.horizontal, 16)
         .padding(.top, 12)
+        .frame(maxHeight: .infinity, alignment: .top)
     }
 
     private var chartHeader: some View {
@@ -395,6 +429,17 @@ struct GraphView: View {
         }
     }
 
+    /// Lets the user rank neighbors by cosine, dot product, or Euclidean distance. Bound to the
+    /// view model's `metric`, whose `didSet` re-ranks the current selection automatically.
+    private var metricPicker: some View {
+        Picker("Distance metric", selection: $viewModel.metric) {
+            ForEach(DistanceMetric.allCases, id: \.self) { metric in
+                Text(metric.displayName).tag(metric)
+            }
+        }
+        .pickerStyle(.segmented)
+    }
+
     private var searchField: some View {
         HStack(spacing: 10) {
             TextField("Search vocabulary", text: $viewModel.query)
@@ -427,7 +472,7 @@ struct GraphView: View {
 
                         Spacer()
 
-                        Text(neighbor.similarity.formatted(.number.precision(.fractionLength(3))))
+                        Text(neighbor.score.formatted(.number.precision(.fractionLength(3))))
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
                     }

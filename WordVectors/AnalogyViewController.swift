@@ -19,9 +19,20 @@ final class AnalogyViewController: UIViewController, UITextFieldDelegate, UITabl
     private let computeButton = UIButton(type: .system)
     private let equationLabel = UILabel()
     private let messageLabel = UILabel()
+    private let metricControl = UISegmentedControl(items: DistanceMetric.allCases.map(\.displayName))
+    private let scoreColumnLabel = UILabel()
     private let tableView = UITableView(frame: .zero, style: .plain)
 
-    private var results: [(word: String, similarity: Float)] = []
+    private var results: [(word: String, score: Float)] = []
+
+    /// The metric currently selected in the picker. The analogy is recomputed whenever it changes.
+    private var metric: DistanceMetric {
+        DistanceMetric.allCases[metricControl.selectedSegmentIndex]
+    }
+
+    /// The last computed analogy inputs, kept so switching the metric can re-run the same query
+    /// without the user retyping or re-tapping Compute.
+    private var lastInputs: (base: String, minus: String, plus: String)?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -63,13 +74,35 @@ final class AnalogyViewController: UIViewController, UITextFieldDelegate, UITabl
         messageLabel.textColor = .secondaryLabel
         messageLabel.numberOfLines = 0
 
+        // Metric picker sits above the score column so the user can rescore the same analogy by
+        // cosine, dot product, or Euclidean distance. Selecting one recomputes immediately.
+        metricControl.selectedSegmentIndex = 0
+        metricControl.addTarget(self, action: #selector(metricChanged), for: .valueChanged)
+
+        // Header row over the results: a "Word" caption on the leading edge and the metric's
+        // score-column title on the trailing edge, lined up with the table's two columns.
+        let wordColumnLabel = UILabel()
+        wordColumnLabel.text = "Word"
+        wordColumnLabel.font = .preferredFont(forTextStyle: .caption1)
+        wordColumnLabel.textColor = .secondaryLabel
+
+        scoreColumnLabel.font = .preferredFont(forTextStyle: .caption1)
+        scoreColumnLabel.textColor = .secondaryLabel
+        scoreColumnLabel.textAlignment = .right
+        updateScoreColumnLabel()
+
+        let columnHeaderRow = UIStackView(arrangedSubviews: [wordColumnLabel, UIView(), scoreColumnLabel])
+        columnHeaderRow.axis = .horizontal
+        columnHeaderRow.alignment = .firstBaseline
+
         tableView.dataSource = self
         tableView.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
         tableView.translatesAutoresizingMaskIntoConstraints = false
 
-        let inputStack = UIStackView(arrangedSubviews: [equationLabel, equationRow, computeButton, messageLabel])
+        let inputStack = UIStackView(arrangedSubviews: [equationLabel, equationRow, computeButton, messageLabel, metricControl, columnHeaderRow])
         inputStack.axis = .vertical
         inputStack.spacing = 12
+        inputStack.setCustomSpacing(8, after: metricControl)
         inputStack.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(inputStack)
         view.addSubview(tableView)
@@ -79,11 +112,16 @@ final class AnalogyViewController: UIViewController, UITextFieldDelegate, UITabl
             inputStack.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
             inputStack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
 
-            tableView.topAnchor.constraint(equalTo: inputStack.bottomAnchor, constant: 16),
+            tableView.topAnchor.constraint(equalTo: inputStack.bottomAnchor, constant: 8),
             tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             tableView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
         ])
+    }
+
+    /// Keeps the score-column header in sync with the selected metric ("Score" vs "Distance").
+    private func updateScoreColumnLabel() {
+        scoreColumnLabel.text = metric.scoreColumnTitle
     }
 
     private func configureField(_ field: UITextField, placeholder: String, text: String) {
@@ -131,6 +169,7 @@ final class AnalogyViewController: UIViewController, UITextFieldDelegate, UITabl
         results = []
 
         guard let model = ModelStore.shared.embeddings else {
+            lastInputs = nil
             setMessage("Train a model first (see the Train tab).")
             tableView.reloadData()
             return
@@ -141,6 +180,7 @@ final class AnalogyViewController: UIViewController, UITextFieldDelegate, UITabl
         let plus = normalized(plusField.text)
 
         guard !base.isEmpty, !minus.isEmpty, !plus.isEmpty else {
+            lastInputs = nil
             setMessage("Fill in all three words.")
             tableView.reloadData()
             return
@@ -149,6 +189,7 @@ final class AnalogyViewController: UIViewController, UITextFieldDelegate, UITabl
         // Name any out-of-vocabulary input rather than silently returning nothing.
         let missing = [base, minus, plus].filter { !model.contains($0) }
         if !missing.isEmpty {
+            lastInputs = nil
             appLog.info("Analogy \(base, privacy: .public)−\(minus, privacy: .public)+\(plus, privacy: .public): OOV \(missing.joined(separator: ","), privacy: .public)")
             let list = missing.map { "'\($0)'" }.joined(separator: ", ")
             let plural = missing.count == 1 ? "is" : "are"
@@ -157,14 +198,32 @@ final class AnalogyViewController: UIViewController, UITextFieldDelegate, UITabl
             return
         }
 
-        results = model.analogy(base: base, minus: minus, plus: plus, count: 10)
-        appLog.info("Analogy \(base, privacy: .public)−\(minus, privacy: .public)+\(plus, privacy: .public): \(self.results.count, privacy: .public) results.")
+        lastInputs = (base, minus, plus)
+        runAnalogy(model: model, base: base, minus: minus, plus: plus)
+    }
+
+    /// Runs the analogy for the given inputs under the current metric and refreshes the table.
+    /// Shared by Compute and by the metric picker so both produce identical, consistent output.
+    private func runAnalogy(model: WordEmbeddings, base: String, minus: String, plus: String) {
+        results = model.analogy(base: base, minus: minus, plus: plus, count: 10, metric: metric)
+        appLog.info("Analogy \(base, privacy: .public)−\(minus, privacy: .public)+\(plus, privacy: .public) [\(self.metric.rawValue, privacy: .public)]: \(self.results.count, privacy: .public) results.")
         if results.isEmpty {
             setMessage("No result for \(base) − \(minus) + \(plus).")
         } else {
             setMessage("\(base) − \(minus) + \(plus) ≈")
         }
         tableView.reloadData()
+    }
+
+    /// Re-scores the last analogy when the user picks a different metric, updating the column
+    /// header to match. Does nothing if there's no valid analogy to re-run yet.
+    @objc private func metricChanged() {
+        updateScoreColumnLabel()
+        guard let inputs = lastInputs, let model = ModelStore.shared.embeddings else {
+            tableView.reloadData()
+            return
+        }
+        runAnalogy(model: model, base: inputs.base, minus: inputs.minus, plus: inputs.plus)
     }
 
     private func normalized(_ text: String?) -> String {
@@ -184,8 +243,10 @@ final class AnalogyViewController: UIViewController, UITextFieldDelegate, UITabl
         minusField.isEnabled = ready
         plusField.isEnabled = ready
         computeButton.isEnabled = ready
+        metricControl.isEnabled = ready
         if !ready {
             results = []
+            lastInputs = nil
             setMessage("No model yet — train one on the Train tab.")
             tableView.reloadData()
         } else if results.isEmpty {
@@ -205,7 +266,7 @@ final class AnalogyViewController: UIViewController, UITextFieldDelegate, UITabl
         let item = results[indexPath.row]
         var content = cell.defaultContentConfiguration()
         content.text = "\(indexPath.row + 1).  \(item.word)"
-        content.secondaryText = String(format: "%.3f", item.similarity)
+        content.secondaryText = String(format: "%.3f", item.score)
         content.prefersSideBySideTextAndSecondaryText = true
         cell.contentConfiguration = content
         cell.selectionStyle = .none

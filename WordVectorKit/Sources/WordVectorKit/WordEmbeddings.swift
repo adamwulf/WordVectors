@@ -92,26 +92,52 @@ public final class WordEmbeddings {
     /// N nearest words to `word` by cosine similarity, excluding the query itself.
     /// Returns an empty array if `word` is out of vocabulary.
     public func nearest(to word: String, count: Int) -> [(word: String, similarity: Float)] {
-        guard let row = index[word] else { return [] }
-        let start = row * vectorSize
-        let query = Array(storage[start..<(start + vectorSize)])
-        return nearest(to: query, count: count, excluding: [word])
+        nearest(to: word, count: count, metric: .cosine)
+            .map { (word: $0.word, similarity: $0.score) }
     }
 
     /// N nearest words to an arbitrary `vector` by cosine similarity.
     /// Words in `excluding` are omitted from the result (used for word algebra).
     public func nearest(to vector: [Float], count: Int, excluding: Set<String>) -> [(word: String, similarity: Float)] {
+        nearest(to: vector, count: count, excluding: excluding, metric: .cosine)
+            .map { (word: $0.word, similarity: $0.score) }
+    }
+
+    /// Word algebra: `base - minus + plus`, then the nearest words to the result,
+    /// excluding the three input words. Returns empty if any input is out of vocabulary.
+    public func analogy(base: String, minus: String, plus: String, count: Int) -> [(word: String, similarity: Float)] {
+        analogy(base: base, minus: minus, plus: plus, count: count, metric: .cosine)
+            .map { (word: $0.word, similarity: $0.score) }
+    }
+
+    // MARK: - Nearest-neighbor queries (metric-aware)
+
+    /// N nearest words to `word` under `metric`, excluding the query itself. The `score` is the
+    /// metric's natural value (similarity for cosine/dot, distance for Euclidean). Results are
+    /// returned best-first per the metric. Empty if `word` is out of vocabulary.
+    public func nearest(to word: String, count: Int, metric: DistanceMetric) -> [(word: String, score: Float)] {
+        guard let row = index[word] else { return [] }
+        let start = row * vectorSize
+        let query = Array(storage[start..<(start + vectorSize)])
+        return nearest(to: query, count: count, excluding: [word], metric: metric)
+    }
+
+    /// N nearest words to an arbitrary `vector` under `metric`. Words in `excluding` are omitted
+    /// (used for word algebra). The `score` is the metric's natural value; results are best-first.
+    public func nearest(to vector: [Float], count: Int, excluding: Set<String>, metric: DistanceMetric) -> [(word: String, score: Float)] {
         guard count > 0, vector.count == vectorSize, !words.isEmpty else { return [] }
 
-        // Norm of the query vector.
+        // Norm of the query vector. Only cosine needs it; skip the work for the other metrics.
         var queryNorm: Float = 0
-        vector.withUnsafeBufferPointer { qb in
-            vDSP_svesq(qb.baseAddress!, 1, &queryNorm, vDSP_Length(vectorSize))
+        if metric == .cosine {
+            vector.withUnsafeBufferPointer { qb in
+                vDSP_svesq(qb.baseAddress!, 1, &queryNorm, vDSP_Length(vectorSize))
+            }
+            queryNorm = queryNorm.squareRoot()
+            guard queryNorm > 0 else { return [] }
         }
-        queryNorm = queryNorm.squareRoot()
-        guard queryNorm > 0 else { return [] }
 
-        var scored: [(word: String, similarity: Float)] = []
+        var scored: [(word: String, score: Float)] = []
         scored.reserveCapacity(words.count)
 
         vector.withUnsafeBufferPointer { qb in
@@ -119,21 +145,40 @@ public final class WordEmbeddings {
                 for row in 0..<words.count {
                     let w = words[row]
                     if excluding.contains(w) { continue }
-                    let rowNorm = norms[row]
-                    if rowNorm == 0 { continue } // zero vector has undefined cosine; skip.
-
-                    var dot: Float = 0
                     let base = sb.baseAddress! + row * vectorSize
-                    vDSP_dotpr(qb.baseAddress!, 1, base, 1, &dot, vDSP_Length(vectorSize))
-                    let cosine = dot / (queryNorm * rowNorm)
-                    scored.append((word: w, similarity: cosine))
+
+                    let score: Float
+                    switch metric {
+                    case .cosine:
+                        let rowNorm = norms[row]
+                        if rowNorm == 0 { continue } // zero vector has undefined cosine; skip.
+                        var dot: Float = 0
+                        vDSP_dotpr(qb.baseAddress!, 1, base, 1, &dot, vDSP_Length(vectorSize))
+                        score = dot / (queryNorm * rowNorm)
+                    case .dotProduct:
+                        var dot: Float = 0
+                        vDSP_dotpr(qb.baseAddress!, 1, base, 1, &dot, vDSP_Length(vectorSize))
+                        score = dot
+                    case .euclidean:
+                        // vDSP_distancesq gives the squared L2 distance; its square root is the
+                        // actual distance. Ordering by squared distance is identical, but the
+                        // reported score is the true distance so the UI shows real units.
+                        var distanceSquared: Float = 0
+                        vDSP_distancesq(qb.baseAddress!, 1, base, 1, &distanceSquared, vDSP_Length(vectorSize))
+                        score = distanceSquared.squareRoot()
+                    }
+                    scored.append((word: w, score: score))
                 }
             }
         }
 
-        // Sort descending by similarity; break ties on the word for determinism.
+        // Sort best-first per the metric (similarities descending, distances ascending);
+        // break ties on the word for determinism.
+        let higherIsBetter = metric.isHigherBetter
         scored.sort { a, b in
-            if a.similarity != b.similarity { return a.similarity > b.similarity }
+            if a.score != b.score {
+                return higherIsBetter ? a.score > b.score : a.score < b.score
+            }
             return a.word < b.word
         }
 
@@ -143,9 +188,9 @@ public final class WordEmbeddings {
         return scored
     }
 
-    /// Word algebra: `base - minus + plus`, then the nearest words to the result,
-    /// excluding the three input words. Returns empty if any input is out of vocabulary.
-    public func analogy(base: String, minus: String, plus: String, count: Int) -> [(word: String, similarity: Float)] {
+    /// Word algebra under `metric`: `base - minus + plus`, then the nearest words to the result,
+    /// excluding the three inputs. Empty if any input is out of vocabulary.
+    public func analogy(base: String, minus: String, plus: String, count: Int, metric: DistanceMetric) -> [(word: String, score: Float)] {
         guard let vb = vector(for: base),
               let vm = vector(for: minus),
               let vp = vector(for: plus) else {
@@ -155,6 +200,6 @@ public final class WordEmbeddings {
         for i in 0..<vectorSize {
             result[i] = vb[i] - vm[i] + vp[i]
         }
-        return nearest(to: result, count: count, excluding: [base, minus, plus])
+        return nearest(to: result, count: count, excluding: [base, minus, plus], metric: metric)
     }
 }
