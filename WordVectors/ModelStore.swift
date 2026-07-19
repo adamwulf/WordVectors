@@ -48,7 +48,14 @@ struct TrainingInfo: Codable {
 
     /// A short human-readable summary of the corpus (e.g. "1 book" or "3 books").
     var scopeSummary: String {
-        bookTitles.count == 1 ? "1 book" : "\(bookTitles.count) books"
+        Self.bookCountSummary(bookTitles.count)
+    }
+
+    /// Formats a book count as "1 book" / "N books". Shared so every corpus-size label
+    /// (this summary, the training footer, its VoiceOver label, the book-list sheet) pluralizes
+    /// identically from one place.
+    static func bookCountSummary(_ count: Int) -> String {
+        count == 1 ? "1 book" : "\(count) books"
     }
 }
 

@@ -440,7 +440,7 @@ final class TrainViewController: UIViewController {
             detailLabel.accessibilityLabel = nil
             detailLabel.accessibilityHint = nil
         } else {
-            let scope = footerBookTitles.count == 1 ? "1 book" : "\(footerBookTitles.count) books"
+            let scope = TrainingInfo.bookCountSummary(footerBookTitles.count)
             detailLabel.accessibilityTraits.insert(.button)
             detailLabel.accessibilityLabel = "List the \(scope) trained on"
             detailLabel.accessibilityHint = "Shows the full list of books in the training corpus"
@@ -832,7 +832,9 @@ private final class BookListViewController: UITableViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        title = titles.count == 1 ? "1 Book" : "\(titles.count) Books"
+        // Title Case the shared "N book(s)" summary for the nav bar, so pluralization stays in
+        // one place (TrainingInfo.bookCountSummary) while the title keeps iOS's Title Case.
+        title = TrainingInfo.bookCountSummary(titles.count).capitalized
         navigationItem.rightBarButtonItem = UIBarButtonItem(
             systemItem: .done, primaryAction: UIAction { [weak self] _ in
                 self?.dismiss(animated: true)
