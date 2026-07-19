@@ -1,0 +1,68 @@
+{
+  "fill" : {
+    "linear-gradient" : [
+      "display-p3:0.49510,0.83893,0.88313,1.00000",
+      "display-p3:0.35516,0.66986,0.71032,1.00000"
+    ],
+    "orientation" : {
+      "start" : {
+        "x" : 0.5,
+        "y" : 0
+      },
+      "stop" : {
+        "x" : 0.5,
+        "y" : 0.7
+      }
+    }
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "fill-specializations" : [
+            {
+              "value" : {
+                "solid" : "display-p3:0.15294,0.14902,0.14118,1.00000"
+              }
+            },
+            {
+              "appearance" : "dark",
+              "value" : {
+                "solid" : "display-p3:0.49510,0.83893,0.88313,1.00000"
+              }
+            },
+            {
+              "appearance" : "tinted",
+              "value" : {
+                "solid" : "display-p3:0.65765,0.83343,0.94445,1.00000"
+              }
+            }
+          ],
+          "image-name" : "compass.svg",
+          "name" : "compass",
+          "position" : {
+            "scale" : 0.8,
+            "translation-in-points" : [
+              0,
+              0.8901338064697484
+            ]
+          }
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}
