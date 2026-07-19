@@ -424,6 +424,27 @@ final class TrainViewController: UIViewController {
             retrainButton.isHidden = true
             detailLabel.text = message
         }
+        // Keep the footer's tap affordance in sync with reality: only the ready state populates
+        // `footerBookTitles`, so only then should VoiceOver present the label as an activatable
+        // button. All other states clear the button trait so it reads as plain text.
+        updateFooterAccessibility()
+    }
+
+    /// Mirrors the tappable-footer state into VoiceOver. When a trained model is shown the
+    /// footer lists its books on tap, so it advertises the `.button` trait, a descriptive label,
+    /// and a hint; otherwise it is a plain, non-interactive text element. Matches the affordance
+    /// the sibling `BookRow`/`SelectAllRow` controls expose.
+    private func updateFooterAccessibility() {
+        if footerBookTitles.isEmpty {
+            detailLabel.accessibilityTraits.remove(.button)
+            detailLabel.accessibilityLabel = nil
+            detailLabel.accessibilityHint = nil
+        } else {
+            let scope = footerBookTitles.count == 1 ? "1 book" : "\(footerBookTitles.count) books"
+            detailLabel.accessibilityTraits.insert(.button)
+            detailLabel.accessibilityLabel = "List the \(scope) trained on"
+            detailLabel.accessibilityHint = "Shows the full list of books in the training corpus"
+        }
     }
 
     private func readyDetail(model: WordEmbeddings) -> String {
