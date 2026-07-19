@@ -14,31 +14,6 @@ github_authed_url() {
     echo "https://${1}:${2}@github.com/${github_path}"
 }
 
-# Fetch the current version number from the built app
-get_app_version() {
-    # Get the path to the .app bundle
-    app_path="${1}/Products/Applications"
-    # Find the .app file
-    app_file=$(find "$app_path" -name "*.app" -maxdepth 1)
-    # Get the path to the Info.plist file
-    plist_path="${app_file}/Contents/Info.plist"
-    # Check if the plist file exists
-    if [ ! -f "$plist_path" ]; then
-        echo "Error: plist file not found at $plist_path"
-        return 1
-    fi
-
-    # Extract the version number from the Info.plist file
-    version=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "${plist_path}")
-
-    # Check if the version number was successfully extracted
-    if [ -z "$version" ]; then
-        echo "Error: failed to extract version number from plist file"
-        return 1
-    fi
-    echo $version
-}
-
 # Next, automatically tag the build in Github
 
 if [ "$CI_XCODEBUILD_EXIT_CODE" -eq 0 ]; then
@@ -49,8 +24,11 @@ if [ "$CI_XCODEBUILD_EXIT_CODE" -eq 0 ]; then
     remote_url=$(github_authed_url $GITHUB_USERNAME $GITHUB_TOKEN)
 
     # --- Generate TestFlight "What to Test" notes -------------------------
-    # Xcode Cloud auto-uploads WordVectors/TestFlight/WhatToTest.<locale>.txt
-    # as the tester-facing "What to Test" notes. We generate it here from the commit
+    # Xcode Cloud auto-uploads TestFlight/WhatToTest.<locale>.txt as the
+    # tester-facing "What to Test" notes. Apple requires the TestFlight folder
+    # to sit next to the Xcode project/workspace; WordVectors.xcodeproj is at the
+    # repository root, so the folder lives at the repo root (not under the
+    # WordVectors/ source subfolder). We generate it here from the commit
     # range since the last build, so nothing is committed to the repo — the
     # file lives only in this ephemeral clone. Gated on the signed-app path so
     # it runs only for distribution builds that actually upload to TestFlight.
@@ -77,7 +55,7 @@ if [ "$CI_XCODEBUILD_EXIT_CODE" -eq 0 ]; then
             notes="- Maintenance build (no source changes since last build)"
         fi
 
-        notes_dir="$CI_PRIMARY_REPOSITORY_PATH/WordVectors/TestFlight"
+        notes_dir="$CI_PRIMARY_REPOSITORY_PATH/TestFlight"
         mkdir -p "$notes_dir"
         printf '%s\n' "$notes" > "$notes_dir/WhatToTest.en-US.txt"
         echo "Wrote What-to-Test notes (previous tag: ${prev_tag:-none})"
