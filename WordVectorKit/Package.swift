@@ -11,16 +11,27 @@ let package = Package(
         .library(
             name: "WordVectorKit",
             targets: ["WordVectorKit"]
+        ),
+        .executable(
+            name: "w2v-bench",
+            targets: ["w2v-bench"]
         )
     ],
     targets: [
         .target(
             name: "WordVectorKit",
             dependencies: [],
+            swiftSettings: [
+                .unsafeFlags(["-Ounchecked"], .when(configuration: .release))
+            ],
             linkerSettings: [
                 // Accelerate is a system framework used for vDSP dot products / AXPY updates.
                 .linkedFramework("Accelerate")
             ]
+        ),
+        .executableTarget(
+            name: "w2v-bench",
+            dependencies: ["WordVectorKit"]
         ),
         .testTarget(
             name: "WordVectorKitTests",

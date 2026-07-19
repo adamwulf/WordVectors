@@ -23,6 +23,7 @@
 //  entry in our vocabulary.
 
 import Foundation
+import Accelerate
 
 /// Pure-Swift, in-memory port of word2vec (CBOW + skip-gram, negative sampling only;
 /// hierarchical softmax is intentionally omitted). Single-threaded for correctness.
@@ -167,6 +168,11 @@ public final class Word2Vec {
         let negative = params.negativeSamples
         let sample = params.subsample
         let useCBOW = params.useCBOW
+        let trainWordsDouble = Double(trainWords)
+        let sampleTrainWords = sample * trainWordsDouble
+
+        // Reuse the kept-token buffer across every sentence and epoch.
+        var sen: [Int] = []
 
         syn0.withUnsafeMutableBufferPointer { syn0Buf in
         syn1neg.withUnsafeMutableBufferPointer { syn1Buf in
@@ -184,14 +190,14 @@ public final class Word2Vec {
                 for sentence in tokenizedSentences {
                     // 3a) Apply subsampling to build this sentence's kept-token list.
                     //     ref: word2vec.c lines 407-412
-                    var sen: [Int] = []
+                    sen.removeAll(keepingCapacity: true)
                     sen.reserveCapacity(sentence.count)
                     for word in sentence {
                         wordCount += 1
                         if sample > 0 {
                             let cn = Double(vocab[word].cn)
                             // ran = (sqrt(cn / (sample*train_words)) + 1) * (sample*train_words) / cn
-                            let ran = (sqrt(cn / (sample * Double(trainWords))) + 1) * (sample * Double(trainWords)) / cn
+                            let ran = (sqrt(cn / sampleTrainWords) + 1) * sampleTrainWords / cn
                             nextRandom = nextRandom &* 25214903917 &+ 11
                             if ran < Double(nextRandom & 0xFFFF) / Double(65536) {
                                 continue // discard this frequent word
@@ -275,7 +281,7 @@ public final class Word2Vec {
                 if c >= 0 && c < sentenceLength {
                     let lastWord = sen[c]
                     let base = lastWord * layer1Size
-                    for j in 0..<layer1Size { neu1[j] += syn0[base + j] }
+                    vDSP_vadd(neu1, 1, syn0 + base, 1, neu1, 1, vDSP_Length(layer1Size))
                     cw += 1
                 }
             }
@@ -285,7 +291,8 @@ public final class Word2Vec {
         guard cw > 0 else { return }
 
         // Average the context vectors. ref: word2vec.c line 448
-        for j in 0..<layer1Size { neu1[j] /= Float(cw) }
+        var cwFloat = Float(cw)
+        vDSP_vsdiv(neu1, 1, &cwFloat, neu1, 1, vDSP_Length(layer1Size))
 
         // NEGATIVE SAMPLING. ref: word2vec.c lines 465-484
         for d in 0..<(negative + 1) {
@@ -309,11 +316,11 @@ public final class Word2Vec {
 
             // f = dot(neu1, syn1neg[target]) ref: word2vec.c lines 477-478
             var f: Float = 0
-            for c in 0..<layer1Size { f += neu1[c] * syn1neg[l2 + c] }
+            vDSP_dotpr(neu1, 1, syn1neg + l2, 1, &f, vDSP_Length(layer1Size))
 
             // g = (label - sigmoid(f)) * alpha, with the clipped-exp-table lookup.
             // ref: word2vec.c lines 479-481
-            let g: Float
+            var g: Float
             if f > Word2Vec.maxExp {
                 g = (label - 1) * alpha
             } else if f < -Word2Vec.maxExp {
@@ -324,8 +331,8 @@ public final class Word2Vec {
             }
 
             // Accumulate hidden error and update output weights. ref: word2vec.c lines 482-483
-            for c in 0..<layer1Size { neu1e[c] += g * syn1neg[l2 + c] }
-            for c in 0..<layer1Size { syn1neg[l2 + c] += g * neu1[c] }
+            vDSP_vsma(syn1neg + l2, 1, &g, neu1e, 1, neu1e, 1, vDSP_Length(layer1Size))
+            vDSP_vsma(neu1, 1, &g, syn1neg + l2, 1, syn1neg + l2, 1, vDSP_Length(layer1Size))
         }
 
         // hidden -> in: apply the accumulated error to each context word. ref: word2vec.c lines 486-493
@@ -336,7 +343,7 @@ public final class Word2Vec {
                 if c >= 0 && c < sentenceLength {
                     let lastWord = sen[c]
                     let base = lastWord * layer1Size
-                    for j in 0..<layer1Size { syn0[base + j] += neu1e[j] }
+                    vDSP_vadd(syn0 + base, 1, neu1e, 1, syn0 + base, 1, vDSP_Length(layer1Size))
                 }
             }
             a += 1
@@ -389,10 +396,10 @@ public final class Word2Vec {
 
                         // f = dot(syn0[context], syn1neg[target]) ref: word2vec.c lines 533-534
                         var f: Float = 0
-                        for j in 0..<layer1Size { f += syn0[l1 + j] * syn1neg[l2 + j] }
+                        vDSP_dotpr(syn0 + l1, 1, syn1neg + l2, 1, &f, vDSP_Length(layer1Size))
 
                         // g = (label - sigmoid(f)) * alpha. ref: word2vec.c lines 535-537
-                        let g: Float
+                        var g: Float
                         if f > Word2Vec.maxExp {
                             g = (label - 1) * alpha
                         } else if f < -Word2Vec.maxExp {
@@ -403,13 +410,13 @@ public final class Word2Vec {
                         }
 
                         // Accumulate error and update output weights. ref: word2vec.c lines 538-539
-                        for j in 0..<layer1Size { neu1e[j] += g * syn1neg[l2 + j] }
-                        for j in 0..<layer1Size { syn1neg[l2 + j] += g * syn0[l1 + j] }
+                        vDSP_vsma(syn1neg + l2, 1, &g, neu1e, 1, neu1e, 1, vDSP_Length(layer1Size))
+                        vDSP_vsma(syn0 + l1, 1, &g, syn1neg + l2, 1, syn1neg + l2, 1, vDSP_Length(layer1Size))
                     }
 
                     // Learn input -> hidden: apply accumulated error to the context word.
                     // ref: word2vec.c line 542
-                    for j in 0..<layer1Size { syn0[l1 + j] += neu1e[j] }
+                    vDSP_vadd(syn0 + l1, 1, neu1e, 1, syn0 + l1, 1, vDSP_Length(layer1Size))
                 }
             }
             a += 1
