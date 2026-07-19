@@ -35,11 +35,37 @@ nonisolated enum CorpusLoader {
             let stem = url.deletingPathExtension().lastPathComponent
             return CorpusBook(stem: stem, title: title(for: url) ?? stem, url: url)
         }
-        // Sort by title so the picker reads naturally; ties broken by stem for stability.
+        // Sort by title so the picker reads naturally, ignoring a leading article so
+        // "The Odyssey" files under O and "A Room with a View" under R. Ties on the
+        // article-stripped key fall back to the full title, then the stem, so the order
+        // is deterministic and stable across launches.
         return books.sorted {
-            $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
-                || ($0.title.localizedCaseInsensitiveCompare($1.title) == .orderedSame && $0.stem < $1.stem)
+            switch sortKey(for: $0.title).localizedCaseInsensitiveCompare(sortKey(for: $1.title)) {
+            case .orderedAscending: return true
+            case .orderedDescending: return false
+            case .orderedSame:
+                switch $0.title.localizedCaseInsensitiveCompare($1.title) {
+                case .orderedAscending: return true
+                case .orderedDescending: return false
+                case .orderedSame: return $0.stem < $1.stem
+                }
+            }
         }
+    }
+
+    /// The title with a leading English article ("A ", "An ", "The ") removed, used only
+    /// for ordering the picker. Matching is case-insensitive; the displayed title is
+    /// unchanged. If stripping would leave nothing (e.g. a book literally titled "The"),
+    /// the original title is kept so it still has a sort position.
+    static func sortKey(for title: String) -> String {
+        let articles = ["the ", "an ", "a "]
+        let lower = title.lowercased()
+        for article in articles where lower.hasPrefix(article) {
+            let stripped = String(title.dropFirst(article.count))
+                .trimmingCharacters(in: .whitespaces)
+            return stripped.isEmpty ? title : stripped
+        }
+        return title
     }
 
     /// Reads the `Title:` line from a Project Gutenberg file's header. Returns `nil` if the
