@@ -87,6 +87,29 @@ public final class WordEmbeddings {
         return index[word] != nil
     }
 
+    // MARK: - Internal contiguous access
+
+    /// Grants scoped read-only access to the raw row-major vector storage.
+    ///
+    /// Row `r`'s vector begins at `base + r * vectorSize` and runs `vectorSize` elements; there
+    /// are `rowCount` rows. This exists so in-package math (e.g. clustering) can run vDSP kernels
+    /// straight over the backing buffer instead of copying one `[Float]` per word. The pointer is
+    /// valid only for the duration of `body`; callers must not escape it. Kept `internal` so the
+    /// storage stays fully encapsulated from outside the package.
+    func withUnsafeContiguousVectors<Result>(
+        _ body: (_ base: UnsafePointer<Float>, _ rowCount: Int) throws -> Result
+    ) rethrows -> Result {
+        try storage.withUnsafeBufferPointer { buffer in
+            // An empty model has no base address; hand back a valid dummy pointer with a zero
+            // row count so `body` can be written without a nil check.
+            if let base = buffer.baseAddress {
+                return try body(base, words.count)
+            }
+            var placeholder: Float = 0
+            return try withUnsafePointer(to: &placeholder) { try body($0, 0) }
+        }
+    }
+
     // MARK: - Nearest-neighbor queries
 
     /// N nearest words to `word` by cosine similarity, excluding the query itself.
