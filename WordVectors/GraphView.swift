@@ -159,7 +159,7 @@ private final class GraphViewModel: ObservableObject {
     /// The palette's categorical hues for the currently visible clusters, keyed by cluster index,
     /// ready to hand to `.chartForegroundStyleScale(mapping:)`. Muted clusters are absent here and
     /// fall back to a neutral grey in the chart.
-    private(set) var clusterCount = 0
+    @Published private(set) var clusterCount = 0
 
     private var embeddings: WordEmbeddings?
     private var projectionGeneration = 0
@@ -181,6 +181,10 @@ private final class GraphViewModel: ObservableObject {
     /// this no longer matches the plotted word count, so the assignments always cover exactly the
     /// points on screen.
     private var clusteredWordCount = 0
+
+    /// The requested `k` that the current `clusterResult` was computed for. Clustering re-runs when
+    /// this no longer matches `clusterK`, so a cached result from a different k can never be reused.
+    private var clusteredK = 0
 
     /// The most recent completed clustering result, retained so the legend and per-point visibility
     /// can be recomputed when top-N or isolation changes without re-running k-means.
@@ -358,7 +362,9 @@ private final class GraphViewModel: ObservableObject {
     /// plotted word count — used when the user first switches into Clusters mode so a cached result
     /// (from an earlier toggle) is reused instead of recomputed.
     func requestClusteringIfNeeded() {
-        guard clusterResult == nil || clusteredWordCount != points.count else { return }
+        guard clusterResult == nil
+            || clusteredWordCount != points.count
+            || clusteredK != clusterK else { return }
         requestClustering()
     }
 
@@ -374,6 +380,7 @@ private final class GraphViewModel: ObservableObject {
         clusterLegend = []
         clusterCount = 0
         clusteredWordCount = 0
+        clusteredK = 0
         isClustering = false
         isolatedCluster = nil
     }
@@ -410,17 +417,18 @@ private final class GraphViewModel: ObservableObject {
             // k-means cannot be interrupted mid-run, but a stale generation means either the model
             // changed or a newer k landed first, so an older completion must never overwrite it.
             guard let self, generation == self.clusteringGeneration, let result else { return }
-            self.applyClustering(result, wordCount: wordCount)
+            self.applyClustering(result, wordCount: wordCount, k: k)
         }
     }
 
     /// Stores a completed clustering result and derives the word→cluster map. Top-N is re-clamped
     /// to the new cluster count and any stale isolation is cleared, then the legend and per-point
     /// visibility are rebuilt.
-    private func applyClustering(_ result: ClusteringResult, wordCount: Int) {
+    private func applyClustering(_ result: ClusteringResult, wordCount: Int, k: Int) {
         clusterResult = result
         clusterCount = result.clusterCount
         clusteredWordCount = wordCount
+        clusteredK = k
         clusterByWord = Dictionary(
             result.assignments.map { ($0.word, $0.cluster) },
             uniquingKeysWith: { first, _ in first }

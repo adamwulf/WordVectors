@@ -222,6 +222,82 @@ final class WordEmbeddingsClusteringTests: XCTestCase {
         XCTAssertEqual(result.sizes.reduce(0, +), 30)
     }
 
+    // MARK: - Re-seed and zero-total edge paths
+
+    func testEmptyClusterReseedProducesWellFormedResult() {
+        // Many identical points along one direction plus a couple of outliers, with k far larger
+        // than the number of distinct directions. k-means++ and Lloyd's will repeatedly empty
+        // clusters here, so the re-seed path is exercised hard. The result must still be total and
+        // well-formed: every returned cluster non-empty, sizes summing to wordCount, and one
+        // non-empty representative list per cluster.
+        var dictionary: [String: [Float]] = [:]
+        // 30 coincident points all pointing the same way.
+        for index in 0..<30 {
+            dictionary["same\(index)"] = [1, 0, 0, 0]
+        }
+        // Two lone outliers along other axes.
+        dictionary["out_a"] = [0, 1, 0, 0]
+        dictionary["out_b"] = [0, 0, 1, 0]
+
+        let embeddings = WordEmbeddings(dictionary: dictionary)
+        let wordCount = dictionary.count
+
+        // k = 8 vastly exceeds the 3 distinct directions, forcing repeated empty-cluster re-seeds.
+        let result = embeddings.cluster(k: 8, wordCount: wordCount, labelsPerCluster: 3, seed: 99)
+
+        XCTAssertEqual(result.sizes.reduce(0, +), wordCount)
+        XCTAssertEqual(result.sizes.count, result.clusterCount)
+        XCTAssertTrue(result.sizes.allSatisfy { $0 >= 1 }, "a returned cluster was empty")
+
+        XCTAssertEqual(result.representatives.count, result.clusterCount)
+        XCTAssertTrue(result.representatives.allSatisfy { !$0.isEmpty },
+                      "a cluster produced no representatives")
+
+        // Determinism: the same seed reproduces the same partition even through the re-seed path.
+        let again = embeddings.cluster(k: 8, wordCount: wordCount, labelsPerCluster: 3, seed: 99)
+        XCTAssertEqual(result.sizes, again.sizes)
+        XCTAssertEqual(result.representatives, again.representatives)
+        for index in result.assignments.indices {
+            XCTAssertEqual(result.assignments[index].cluster, again.assignments[index].cluster)
+        }
+    }
+
+    func testAllIdenticalUnitVectorsHitZeroTotalPathWithoutTrapping() {
+        // Every vector points the exact same direction, so after the first k-means++ centroid every
+        // point's nearest-distance² is 0 and the D²-weighted sampling total is 0. This drives the
+        // zero-total fallback branch for k > 1. The method must stay total (no divide-by-zero, no
+        // index trap) and return a well-formed result.
+        var dictionary: [String: [Float]] = [:]
+        for index in 0..<12 {
+            dictionary["u\(index)"] = [3, 4, 0] // all the same direction (normalizes to the same unit vector)
+        }
+
+        let embeddings = WordEmbeddings(dictionary: dictionary)
+        let wordCount = dictionary.count
+
+        let result = embeddings.cluster(k: 5, wordCount: wordCount, labelsPerCluster: 3, seed: 17)
+
+        XCTAssertEqual(result.sizes.reduce(0, +), wordCount)
+        XCTAssertEqual(result.sizes.count, result.clusterCount)
+        XCTAssertTrue(result.sizes.allSatisfy { $0 >= 1 }, "a returned cluster was empty")
+
+        XCTAssertEqual(result.representatives.count, result.clusterCount)
+        XCTAssertTrue(result.representatives.allSatisfy { !$0.isEmpty },
+                      "a cluster produced no representatives")
+
+        // Every assignment references a real word and a valid cluster index.
+        let vocabularySet = Set(embeddings.vocabulary.prefix(wordCount))
+        for assignment in result.assignments {
+            XCTAssertTrue(vocabularySet.contains(assignment.word))
+            XCTAssertTrue((0..<result.clusterCount).contains(assignment.cluster))
+        }
+
+        // Deterministic through the zero-total path too.
+        let again = embeddings.cluster(k: 5, wordCount: wordCount, labelsPerCluster: 3, seed: 17)
+        XCTAssertEqual(result.sizes, again.sizes)
+        XCTAssertEqual(result.representatives, again.representatives)
+    }
+
     // MARK: - Fixtures
 
     /// A modest deterministic vocabulary: three coarse groups in 6-D so real clustering runs.

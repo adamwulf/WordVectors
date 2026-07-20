@@ -38,9 +38,13 @@ extension WordEmbeddings {
     ///
     /// ## Determinism
     /// The result depends only on the stored vectors and `seed`. A seeded SplitMix64 generator
-    /// drives k-means++ seeding; there is no `Date`, `arc4random`, or system RNG anywhere.
-    /// Ties are always broken toward lower indices, so repeated runs with the same seed produce
-    /// byte-for-byte identical assignments, sizes, and representatives.
+    /// drives k-means++ seeding; there is no `Date`, `arc4random`, or system RNG anywhere, and ties
+    /// are always broken toward lower indices. For a given build/target, this makes the result
+    /// reproducible: the same seed over the same binary produces identical assignments, sizes, and
+    /// representatives run after run. It is NOT guaranteed to be byte-for-byte identical across
+    /// different platforms — float summation is non-associative, and the vDSP/BLAS reduction order
+    /// and SIMD width can differ across CPU microarchitectures, so the accumulated floating-point
+    /// sums (and thus the exact partition on near-tied points) may differ from one target to another.
     ///
     /// ## Empty-cluster strategy
     /// If a centroid loses every member during Lloyd's iteration (a real possibility with
@@ -280,17 +284,30 @@ extension WordEmbeddings {
 
                 var chosen = -1
                 if total > 0 {
-                    // Sample a target in [0, total) and walk the cumulative D² weights.
+                    // Sample a target in [0, total) and walk the cumulative D² weights. Zero-weight
+                    // points (those coinciding with an existing centroid) are skipped so the walk
+                    // can never adopt a duplicate of an already-chosen centroid — even when
+                    // `nextUnitFloat()` returns exactly 0.0, which would otherwise let a leading
+                    // zero-weight point satisfy `cumulative >= target` on the first step.
                     let target = generator.nextUnitFloat() * total
                     var cumulative: Float = 0
-                    for point in 0..<pointCount {
+                    for point in 0..<pointCount where nearestDistanceSquared[point] > 0 {
                         cumulative += nearestDistanceSquared[point]
                         if cumulative >= target {
                             chosen = point
                             break
                         }
                     }
-                    if chosen < 0 { chosen = pointCount - 1 } // rounding guard
+                    // Rounding guard: fall back to the last positive-weight index (never a
+                    // zero-weight point). The `total > 0` branch is only entered when at least one
+                    // such point exists, so this always finds one; the -1 default is defensive.
+                    if chosen < 0 {
+                        for point in stride(from: pointCount - 1, through: 0, by: -1)
+                        where nearestDistanceSquared[point] > 0 {
+                            chosen = point
+                            break
+                        }
+                    }
                 } else {
                     for point in 0..<pointCount where nearestDistanceSquared[point] > 0 {
                         chosen = point
